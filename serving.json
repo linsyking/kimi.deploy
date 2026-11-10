@@ -21,7 +21,7 @@
   "speculative": null,
   "watchdog_timeout": 3600,
   "startup_timeout_seconds": 3600,
-  "nccl_debug": "WARN",
+  "nccl_debug": "INFO",
   "extra_env": {},
   "extra_args": []
 }
