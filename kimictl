@@ -14,6 +14,7 @@ import logging
 import os
 from pathlib import Path
 import pwd
+import re
 import secrets
 import shlex
 import signal
@@ -35,12 +36,13 @@ SCRATCH_HOME = '/scratch_local/user_data/yiming'
 LOCAL_BIN = Path(SCRATCH_HOME) / '.local/bin'
 TMUX = LOCAL_BIN / 'tmux'
 RSYNC = LOCAL_BIN / 'rsync'
+NUMACTL = Path(SCRATCH_HOME) / '.local/opt/sysutils/bin/numactl'
 SOCKET = RUNS / 'kimi-tmux'
 PRIVATE = ROOT / '.secrets'
 API_KEY = PRIVATE / 'api-key'
 AUTH_CONFIG = PRIVATE / 'sglang-auth.yaml'
 VERIFIED = '.kimi-verified.json'
-RUNTIME_FILES = ['kimictl', 'serving.json', 'verify_venv.py', 'README.md', 'DEPLOYMENT_STATUS.md', '.gitignore']
+RUNTIME_FILES = ['kimictl', 'serving.json', 'verify_venv.py', 'evict_page_cache.py', 'README.md', 'DEPLOYMENT_STATUS.md', '.gitignore']
 # The only nodes this deployment may use, in rank order: name -> (bond0 IP, hostname).
 NODES = {
     'c04': ('10.78.202.32', 's04-p1-dgx-02-c04'),
@@ -214,6 +216,42 @@ def other_users():
     return names
 
 
+def numa_nodes():
+    """(Grace CPU nodes, CPU-less nodes). The GPUs' HBM is onlined as CPU-less NUMA nodes (ATS)."""
+    cpu, hbm = [], []
+    for path in sorted(Path('/sys/devices/system/node').glob('node[0-9]*'), key=lambda p: int(p.name[4:])):
+        (cpu if (path / 'cpulist').read_text().strip() else hbm).append(path)
+    return cpu, hbm
+
+
+def hbm_page_cache_gib():
+    total_kb = 0
+    for path in numa_nodes()[1]:
+        match = re.search(r'FilePages:\s+(\d+) kB', (path / 'meminfo').read_text())
+        total_kb += int(match.group(1)) if match else 0
+    return total_kb / 2**20
+
+
+def model_dirs(cfg):
+    spec = cfg.get('speculative')
+    return [Path(cfg['model_path'])] + ([Path(spec['draft_model_path'])] if spec else [])
+
+
+def drop_page_cache(cfg):
+    """Drop the model files' clean cached pages (posix_fadvise DONTNEED; no root needed).
+
+    Grace RAM (~958 GiB) is smaller than the checkpoint, so earlier reads of it leave page cache
+    in HBM, which cudaMemGetInfo counts as used and SGLang would subtract from the KV pool."""
+    for root in model_dirs(cfg):
+        for path in root.rglob('*'):
+            if path.is_file():
+                fd = os.open(path, os.O_RDONLY)
+                try:
+                    os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+                finally:
+                    os.close(fd)
+
+
 def port_free(host, port):
     probe = socket.socket()
     try:
@@ -234,10 +272,8 @@ def runtime_digests():
 def node_preflight(cfg, rank):
     """Problems block a start; warnings are reported only."""
     problems, warnings = [], []
-    required = [VENV / 'bin/python', VENV / 'kimi-build.json', TMUX,
-                Path(cfg['model_path']) / VERIFIED]
-    if cfg.get('speculative'):
-        required.append(Path(cfg['speculative']['draft_model_path']) / VERIFIED)
+    required = [VENV / 'bin/python', VENV / 'kimi-build.json', TMUX, NUMACTL]
+    required += [root / VERIFIED for root in model_dirs(cfg)]
     if rank == 0:
         required += [API_KEY, AUTH_CONFIG]
     problems += [f'missing {path}' for path in required if not path.exists()]
@@ -249,8 +285,14 @@ def node_preflight(cfg, rank):
             problems.append(f'GPU {index} recovery action is {gpu["recovery_action"]}')
         if (gpu['fabric_state'], gpu['fabric_status'], gpu['fabric_health']) != ('Completed', 'Success', 'Healthy'):
             problems.append(f'GPU {index} fabric is {gpu["fabric_state"]}/{gpu["fabric_status"]}/{gpu["fabric_health"]}')
-        if not 0 <= gpu['memory_used_mib'] <= 1024:
-            problems.append(f'GPU {index} memory use is {gpu["memory_used_mib"]} MiB (-1: unreadable)')
+        if gpu['memory_used_mib'] < 0:
+            problems.append(f'GPU {index} memory use is unreadable')
+        elif gpu['memory_used_mib'] > 1024:
+            problems.append(f'GPU {index} has {gpu["memory_used_mib"]} MiB in use')
+    cache = hbm_page_cache_gib()
+    if cache >= 1:
+        problems.append(f'{cache:.0f} GiB of page cache sits in HBM (counted as GPU memory in use); '
+                        'start drops the model files\' share, other files\' cache needs their owner')
     if apps:
         problems.append('GPUs have compute processes: ' + '; '.join(apps))
     imex = subprocess.run(['systemctl', 'is-active', 'nvidia-imex'], text=True, capture_output=True).stdout.strip()
@@ -334,7 +376,11 @@ def serve(cfg, rank):
     if os.getpgrp() != os.getpid():
         os.setpgrp()
     env = launch_environment(cfg)
-    command = [str(VENV / 'bin/python'), str(ROOT / 'kimictl'), '_engine', *engine_args(cfg, rank)]
+    # Bind host allocations, page cache included, to Grace RAM: reading the 1.45 TiB checkpoint
+    # would otherwise spill page cache into HBM mid-load. Device allocations ignore this policy.
+    membind = ','.join(path.name[4:] for path in numa_nodes()[0])
+    command = [str(NUMACTL), f'--membind={membind}',
+               str(VENV / 'bin/python'), str(ROOT / 'kimictl'), '_engine', *engine_args(cfg, rank)]
     state = dict(proc_info(os.getpid()), rank=rank, command=command, config=cfg,
                  started_at=time.time(), log=str(LOG))
     temporary = STATE.with_suffix('.tmp')
@@ -524,6 +570,9 @@ def start(cfg, no_wait):
         if running:
             raise RuntimeError(f'engines are starting or unhealthy on {", ".join(running)}; inspect status/logs')
         sync(cfg)
+        for node, result in zip(cfg['nodes'], on_all(cfg, '_drop-cache', timeout=300)):
+            if result.returncode:
+                raise RuntimeError(f'{node["name"]}: dropping page cache failed: {result.stderr.strip()}')
         if not preflight(cfg, quiet=True):
             raise RuntimeError('preflight failed; nothing was started')
         for rank, node in enumerate(cfg['nodes']):
@@ -604,7 +653,7 @@ def main():
     logs.add_argument('-f', '--follow', action='store_true')
     for name in ['_start', '_serve']:
         sub.add_parser(name).add_argument('--rank', type=int, required=True)
-    for name in ['_preflight', '_stop', '_status']:
+    for name in ['_preflight', '_stop', '_status', '_drop-cache']:
         sub.add_parser(name)
     sub.add_parser('_logs').add_argument('-n', type=int, default=60)
     if len(sys.argv) > 1 and sys.argv[1] == '_engine':
@@ -623,6 +672,8 @@ def main():
         node_stop(cfg)
     elif args.action == '_status':
         print(json.dumps(node_status(cfg)))
+    elif args.action == '_drop-cache':
+        drop_page_cache(cfg)
     elif args.action == '_logs':
         return subprocess.call(['tail', '-n', str(args.n), str(LOG)])
     elif args.action == 'preflight':
