@@ -18,7 +18,8 @@ SITE = Path(sysconfig.get_paths()['purelib'])
 CUDA = SITE / 'nvidia/cu13'
 PINS = {
     'torch': '2.14.1+cu130', 'flashinfer-python': '0.7.3', 'flashinfer-cubin': '0.7.3',
-    'flashinfer-jit-cache': '0.7.3+cu130', 'sglang-kernel': '0.4.10', 'sgl-deep-gemm': '0.2.7',
+    'flashinfer-jit-cache': '0.7.3+cu130', 'flashinfer-jit-cache-sm100a': '0.7.3+cu130',
+    'sglang-kernel': '0.4.10', 'sgl-deep-gemm': '0.2.7',
     'sgl-flash-mla': '1.0.4', 'sgl-deep-ep': '0.1.2.post1', 'nvidia-nccl-cu13': '2.30.7',
     'transformers': '5.19.0', 'compressed-tensors': '0.18.0', 'nvidia-cuda-nvcc': '13.0.88',
     'nvidia-cuda-runtime': '13.0.96',
@@ -64,12 +65,19 @@ def check_dynblock():
     digest = hashlib.sha256(header.read_bytes()).hexdigest()
     modules = [path for name in DYNBLOCK_MODULES for path in SITE.glob(f'flashinfer*/**/{name}.so')]
     check('FlashInfer DynBlock modules present', bool(modules), f'{len(modules)} found')
+    import tvm_ffi
     for path in modules:
         marker = path.parent / 'k31-dynblock.json'
         record = json.loads(marker.read_text()) if marker.exists() else {}
         check(f'rebuilt {path.relative_to(SITE)}',
               record.get('header_sha256') == digest and record.get('DynBlockKernelMaxNumExperts') == 1024,
               record.get('arch', 'no marker'))
+        try:
+            # FlashInfer's own loader (flashinfer/jit/core.py); catches unresolved link-time symbols.
+            tvm_ffi.load_module(str(path))
+            check(f'loads {path.name}', True)
+        except Exception as exc:
+            check(f'loads {path.name}', False, str(exc))
 
 
 def check_toolchain():

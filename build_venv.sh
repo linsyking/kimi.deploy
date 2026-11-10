@@ -70,16 +70,35 @@ pip_install -r "$LOCK" -c "$ROOT/constraints-cuda130.txt" \
 step "Image extras: NCCL $NCCL_VERSION for DeepEP, FlashInfer cubin + cu130 jit-cache $FLASHINFER_VERSION"
 pip_install --reinstall --no-deps "nvidia-nccl-cu13==$NCCL_VERSION"
 pip_install --no-deps "flashinfer-cubin==$FLASHINFER_VERSION" --index-url https://flashinfer.ai/whl
-pip_install --no-deps "flashinfer-jit-cache==$FLASHINFER_VERSION+cu130" --index-url https://flashinfer.ai/whl/cu130
+# Since 0.7.3 flashinfer-jit-cache is a meta-package over per-architecture provider wheels;
+# GB200 (compute 10.0) needs only the sm100a one.
+pip_install --no-deps "flashinfer-jit-cache==$FLASHINFER_VERSION+cu130" \
+    "flashinfer-jit-cache-sm100a==$FLASHINFER_VERSION+cu130" --index-url https://flashinfer.ai/whl/cu130
 
 step "SGLang from source with its Rust extensions (non-editable, so the venv is self-contained)"
-pip_install "setuptools>=61" "setuptools-rust>=1.11" "setuptools-scm>=8" wheel
-PATH=$RUST_BIN:$PATH CARGO_HOME=$BUILD/cargo CARGO_BUILD_JOBS=$(nproc) \
-    pip_install --no-deps --no-build-isolation --reinstall-package sglang "$SRC/python"
+built=$("$PY" -I -c 'import importlib.metadata as m; print(m.version("sglang"))' 2>/dev/null || true)
+if [[ "$built" == *"+g${SGLANG_COMMIT:0:9}" ]]; then
+    echo "sglang $built is already built from this commit"
+else
+    pip_install "setuptools>=61" "setuptools-rust>=1.11" "setuptools-scm>=8" wheel
+    PATH=$RUST_BIN:$PATH CARGO_HOME=$BUILD/cargo CARGO_BUILD_JOBS=$(nproc) \
+        pip_install --no-deps --no-build-isolation --reinstall-package sglang "$SRC/python"
+fi
 
 SITE=$("$PY" -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')
 CUDA=$SITE/nvidia/cu13
 [ -x "$CUDA/bin/nvcc" ] || { echo "error: no nvcc at $CUDA/bin" >&2; exit 1; }
+
+step "Toolkit layout in nvidia/cu13: lib64 and unversioned .so links for JIT linking"
+# The wheels ship lib/ with versioned sonames only; FlashInfer's JIT links -L\$CUDA_HOME/lib64
+# -lcudart, as do other JIT builders. These links live outside any wheel's RECORD.
+[ -e "$CUDA/lib64" ] || ln -s lib "$CUDA/lib64"
+for lib in "$CUDA"/lib/lib*.so.[0-9]*; do
+    dev=${lib%%.so.*}.so
+    if [[ "$lib" =~ \.so\.[0-9]+$ ]] && [ ! -e "$dev" ]; then
+        ln -s "$(basename "$lib")" "$dev"
+    fi
+done
 
 step "K3.1 FlashInfer DynBlock: 1024-expert routing header, rebuilt jit-cache modules"
 CC=/usr/bin/gcc-12 CXX=/usr/bin/g++-12 CUDA_HOME=$CUDA CUDA_PATH=$CUDA \
