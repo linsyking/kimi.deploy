@@ -287,8 +287,8 @@ URL on ssh.linsyking.com: http://127.0.0.1:8313/v1, model `kimi-k3.1-pro`; not t
 server side. c02's DeepSeek tunnel (remote 8312) was not touched. `kimictl stop` closes the tunnel
 before stopping the server; nothing restarts it automatically.
 
-At the user's request the API key, URL and model name are in
-`/scratch_local/user_data/kimi-k3.1-pro-endpoint.txt`, mode 0644, readable by every user on c04.
+At the user's request the API key and the endpoint URL, and nothing else (no frp details), are
+in `/scratch_local/user_data/kimi-k3.1-pro-endpoint.txt`, mode 0644, readable by every user on c04.
 
 ## Next
 
