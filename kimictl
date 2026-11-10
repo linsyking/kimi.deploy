@@ -269,6 +269,8 @@ def drop_page_cache(cfg):
 
 def port_free(host, port):
     probe = socket.socket()
+    # As uvicorn and torch's TCPStore bind: TIME-WAIT sockets left by a stop do not block them.
+    probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     try:
         probe.bind((host, port))
         return True

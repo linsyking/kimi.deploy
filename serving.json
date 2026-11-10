@@ -13,15 +13,15 @@
   "tp_size": 16,
   "dcp_size": 16,
   "context_length": 262144,
-  "max_running_requests": 64,
+  "max_running_requests": 32,
   "mem_fraction_static": 0.85,
   "kv_cache_dtype": "fp8_e4m3",
   "mamba_ssm_dtype": "float32",
   "radix_cache": false,
-  "speculative": null,
+  "speculative": {"algorithm": "DFLASH", "draft_model_path": "/scratch_local/user_data/yiming/models/Kimi-K3.1-Dflash2-Preview", "num_draft_tokens": 8},
   "watchdog_timeout": 3600,
   "startup_timeout_seconds": 3600,
-  "nccl_debug": "INFO",
+  "nccl_debug": "WARN",
   "extra_env": {},
   "extra_args": []
 }
