@@ -14,7 +14,7 @@ Serve `moonshotai/Kimi-K3.1-Pro` as one SGLang server spanning 4 GB200 trays (16
 - **Don't modify other users' files.** For example, `/scratch_local/user_data/models/*` and the `*.sqsh` images on c04 belong to jingxinpan. Reading them is fine.
 - **Ask the user before:**
   - starting the 1.56 TB weight download
-  - exposing the endpoint outside the cluster
+  - exposing the endpoint outside the cluster in any way other than the approved frp rule on remote port 8313 (see "Public access via frp")
   - deleting anything outside `kimi.deploy/` and the directories you create
 - **Never reset GPUs or reboot nodes.** Report recovery actions or hung drivers instead.
 
@@ -215,6 +215,45 @@ For agent workloads with repeated prefixes:
 - **DFLASH + DCP graph-capture stall:** see SGLang PR #48178.
 - **MegaMoE plus `--enable-symm-mem`** deadlocks.
 - **Reading crash logs:** a rank that dies with gloo "connection closed/reset by peer" usually means another rank or the head exited first. Read rank 0's log first. That's how a previous K3 4-node run on this rack failed on Sep 20.
+
+## Public access via frp (approved: remote port 8313)
+
+Added 2026-11-10 after your first stages. The user approved publishing the Kimi API through frp on **remote port 8313**. c02's DeepSeek tunnel uses remote port 8312 and must keep running untouched.
+
+**How c02's tunnel works.** Reference: `reference/ds.deploy/ds41ctl`, lines 41–45 for the constants and 485–560 for `tunnel_state`, `tunnel_status`, `tunnel_start` and `tunnel_stop`.
+- `frpc` 0.71.1 connects to the frp server at `ssh.linsyking.com:17000` (129.114.108.73) over TLS, with token auth.
+- Its transport goes through a local `gost` HTTP proxy at `127.0.0.1:18080`. gost is started as `gost -L 'http://127.0.0.1:18080?resolver=https://1.1.1.1/dns-query'`, so DNS goes over HTTPS.
+- `ds41ctl` handles startup:
+  - It runs `frpc verify -c <config>` first.
+  - If gost isn't running it starts it with `nohup`, then starts `frpc` the same way.
+  - It records state in `.runs/frpc.json` and logs to `.runs/frpc.log`.
+  - It refuses to start unless the config's remote-8312 rule targets the configured SGLang host and port, and the API key file exists.
+- The rule `deepseek-c02-18000-to-8312` (tcp) forwards server port 8312 to `10.78.202.30:18000`.
+  - On the frp server, the API is reachable only locally, at `http://127.0.0.1:8312/v1` on `ssh.linsyking.com`.
+  - SGLang's API key protects it.
+
+**Kimi's tunnel on c04:**
+- **Config:** `kimi.deploy/.secrets/frpc.toml`, mode 600 and gitignored, already in place.
+  - It uses the same server, TLS and token as c02's, with one rule: `kimi-c04-30000-to-8313` (tcp), forwarding `10.78.202.32:30000` to remote port 8313.
+  - `frpc verify` passes.
+  - Never copy the token anywhere else: not into logs, docs or commits.
+- **Binaries:** `/scratch_local/user_data/yiming/.local/bin/frpc` and `.../gost` on c04 are byte-identical to c02's.
+- **Run a separate gost and frpc on c04.** `127.0.0.1:18080` is free there.
+  - Don't edit, restart or signal c02's `frpc` or `gost`.
+  - Never reuse the proxy name `deepseek-c02-18000-to-8312`; the frp server keys rules by name.
+- c04 also resolves `ssh.linsyking.com` directly. Keep the gost transport anyway, to match the setup that's known to work.
+- **Add `tunnel start|stop|status` to `kimictl`, modelled on `ds41ctl`:**
+  - Verify the config, and refuse to start unless the 8313 rule targets `serving.json`'s `bind_host:port` and `.secrets/api-key` exists with API-key auth enabled on the server.
+  - Start gost if it isn't running, then start `frpc -c .secrets/frpc.toml` detached, so it survives SSH disconnects.
+  - Record state in `.runs/frpc.json` and log to `.runs/frpc.log`.
+  - Stop it through the recorded process group.
+  - No automatic restart.
+  - Like DeepSeek's tunnel, it needs restarting by hand after a reboot.
+- **When to start it:** only while the server is up, validated and requiring the API key.
+- **Then:** confirm `start proxy success` for `kimi-c04-30000-to-8313` in `.runs/frpc.log`, and tell the user:
+  - the server-local URL, `http://127.0.0.1:8313/v1` on `ssh.linsyking.com`
+  - the served model name, `kimi-k3.1-pro`
+  - You can't test from the frp server side yourself, so report the log lines.
 
 ## Validation checklist
 

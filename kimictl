@@ -22,6 +22,7 @@ import socket
 import subprocess
 import sys
 import time
+import tomllib
 import urllib.error
 import urllib.request
 import xml.etree.ElementTree as ET
@@ -41,6 +42,16 @@ SOCKET = RUNS / 'kimi-tmux'
 PRIVATE = ROOT / '.secrets'
 API_KEY = PRIVATE / 'api-key'
 AUTH_CONFIG = PRIVATE / 'sglang-auth.yaml'
+# frp publishes the API on the frp server's loopback only; c02's DeepSeek tunnel owns remote 8312.
+FRPC = LOCAL_BIN / 'frpc'
+GOST = LOCAL_BIN / 'gost'
+FRPC_CONFIG = PRIVATE / 'frpc.toml'
+FRPC_STATE = RUNS / 'frpc.json'
+FRPC_LOG = RUNS / 'frpc.log'
+TUNNEL_NAME = 'kimi-c04-30000-to-8313'
+TUNNEL_PORT = 8313
+GOST_ADDRESS = ('127.0.0.1', 18080)
+GOST_URL = 'http://127.0.0.1:18080?resolver=https://1.1.1.1/dns-query'
 VERIFIED = '.kimi-verified.json'
 GPU_IDLE_MIB = 1024
 # The driver frees a process's GPU memory only after the process is reaped; how long stop waits.
@@ -598,6 +609,9 @@ def node_stops(nodes, mode, timeout):
 
 def stop(cfg, force=False, drain_timeout=600):
     require_head(cfg)
+    if state_is_alive(tunnel_state()):
+        # Only a running, validated server is published; start the tunnel again by hand.
+        tunnel_stop()
     rank0, followers = cfg['nodes'][0], cfg['nodes'][1:]
     results = node_stops([rank0], 'drain', drain_timeout)
     # Followers exit by themselves within seconds of rank 0's ShutdownReq.
@@ -714,7 +728,127 @@ def status(cfg):
               f'context {cfg["context_length"]:,}; max running {cfg["max_running_requests"]}; '
               f'radix cache {"on" if cfg["radix_cache"] else "off"}; '
               f'decoding {"DFLASH x" + str(spec["num_draft_tokens"]) if spec else "plain"}')
+    print(f'Tunnel: {"running" if state_is_alive(tunnel_state()) else "stopped"} '
+          f'(frp server port {TUNNEL_PORT}; kimictl tunnel status)')
     return 0 if is_healthy and all_up else 1
+
+
+# ----- frp tunnel (c04 only; modelled on ds.deploy's ds41ctl) -----
+
+def tunnel_state():
+    return json.loads(FRPC_STATE.read_text()) if FRPC_STATE.exists() else None
+
+
+def check_tunnel_config(cfg):
+    """The config must hold exactly the approved rule, forwarding to this server's API."""
+    rules = tomllib.loads(FRPC_CONFIG.read_text()).get('proxies', [])
+    expected = {'name': TUNNEL_NAME, 'type': 'tcp', 'localIP': cfg['bind_host'],
+                'localPort': cfg['port'], 'remotePort': TUNNEL_PORT}
+    if len(rules) != 1 or {key: rules[0].get(key) for key in expected} != expected:
+        raise RuntimeError(f'{FRPC_CONFIG} must hold exactly one rule: {expected}')
+
+
+def gost_listening():
+    with socket.socket() as probe:
+        probe.settimeout(1)
+        return probe.connect_ex(GOST_ADDRESS) == 0
+
+
+def require_authenticated_api(cfg):
+    if not healthy(cfg):
+        raise RuntimeError('the API is not healthy; validate the server before exposing it')
+    request(cfg, '/v1/models')
+    try:
+        with OPENER.open(f'http://{cfg["bind_host"]}:{cfg["port"]}/v1/models', timeout=10):
+            raise RuntimeError('refusing to expose an API that accepts unauthenticated requests')
+    except urllib.error.HTTPError as error:
+        if error.code != 401:
+            raise RuntimeError(f'expected HTTP 401 without the API key, got {error.code}') from error
+
+
+def start_gost():
+    """Start the loopback HTTP proxy frpc dials through, unless one is listening already."""
+    if gost_listening():
+        return None
+    child = subprocess.Popen(['nohup', str(GOST), '-L', GOST_URL], cwd=ROOT, stdin=subprocess.DEVNULL,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    deadline = time.monotonic() + 10
+    while not gost_listening():
+        if child.poll() is not None or time.monotonic() > deadline:
+            raise RuntimeError('gost did not start listening on 127.0.0.1:18080')
+        time.sleep(0.2)
+    return child.pid
+
+
+def check_gost_transport():
+    # A real DNS-over-HTTPS lookup through gost, before frpc depends on it.
+    proxy = urllib.request.build_opener(urllib.request.ProxyHandler({'https': 'http://127.0.0.1:18080'}))
+    lookup = urllib.request.Request('https://1.1.1.1/dns-query?name=ssh.linsyking.com&type=A',
+                                    headers={'Accept': 'application/dns-json'})
+    with proxy.open(lookup, timeout=20) as response:
+        answer = json.load(response)
+    if answer.get('Status') != 0 or not answer.get('Answer'):
+        raise RuntimeError('DNS-over-HTTPS lookup of ssh.linsyking.com through gost failed')
+
+
+def tunnel_start(cfg):
+    require_head(cfg)
+    os.umask(0o077)
+    with locked('tunnel'):
+        if state_is_alive(tunnel_state()):
+            return tunnel_status(cfg)
+        missing = [path for path in (FRPC_CONFIG, API_KEY, AUTH_CONFIG, FRPC, GOST) if not path.exists()]
+        if missing:
+            raise RuntimeError('missing ' + ', '.join(map(str, missing)))
+        check_tunnel_config(cfg)
+        require_authenticated_api(cfg)
+        verify = subprocess.run([str(FRPC), 'verify', '-c', str(FRPC_CONFIG)], capture_output=True, timeout=15)
+        if verify.returncode:
+            raise RuntimeError(f'frpc verify failed (exit {verify.returncode}); run it by hand on c04')
+        gost_pid = start_gost()
+        check_gost_transport()
+        offset = FRPC_LOG.stat().st_size if FRPC_LOG.exists() else 0
+        with FRPC_LOG.open('ab') as log:
+            child = subprocess.Popen(['nohup', str(FRPC), '-c', str(FRPC_CONFIG)], cwd=ROOT,
+                                     stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
+                                     start_new_session=True)
+        deadline = time.monotonic() + 30
+        while f'[{TUNNEL_NAME}] start proxy success' not in FRPC_LOG.read_text(errors='replace')[offset:]:
+            if child.poll() is not None:
+                raise RuntimeError(f'frpc exited with {child.returncode}; inspect {FRPC_LOG}')
+            if time.monotonic() > deadline:
+                print(f'frpc is running but has not logged "start proxy success" yet; inspect {FRPC_LOG}')
+                break
+            time.sleep(0.5)
+        FRPC_STATE.write_text(json.dumps(dict(proc_info(child.pid), started_at=time.time(), gost_pid=gost_pid),
+                                         indent=2) + '\n')
+    return tunnel_status(cfg)
+
+
+def tunnel_stop():
+    with locked('tunnel'):
+        state = tunnel_state()
+        if state_is_alive(state):
+            os.killpg(state['pgid'], signal.SIGTERM)
+            deadline = time.monotonic() + 10
+            while state_is_alive(state) and time.monotonic() < deadline:
+                time.sleep(0.2)
+            if state_is_alive(state):
+                raise RuntimeError('frpc did not exit after SIGTERM')
+    print('Tunnel stopped. The loopback gost proxy is left running.')
+    return 0
+
+
+def tunnel_status(cfg):
+    alive = state_is_alive(tunnel_state())
+    print(f'Tunnel: {"running" if alive else "stopped"} ({TUNNEL_NAME}: frp server port {TUNNEL_PORT} -> '
+          f'{cfg["bind_host"]}:{cfg["port"]}); gost {"listening" if gost_listening() else "not listening"}')
+    print(f'Server-local API on ssh.linsyking.com: http://127.0.0.1:{TUNNEL_PORT}/v1, '
+          f'model {cfg["served_model_name"]}; log {FRPC_LOG}')
+    if FRPC_LOG.exists():
+        for line in FRPC_LOG.read_text(errors='replace').splitlines()[-6:]:
+            print('  ' + line)
+    return 0 if alive else 1
 
 
 def main():
@@ -729,6 +863,8 @@ def main():
                                     help='signal processes that did not stop gracefully (a dead rank or a hang)')
     for name in ['start', 'restart']:
         commands[name].add_argument('--no-wait', action='store_true')
+    sub.add_parser('tunnel', help='publish the API through frp on remote port 8313').add_argument(
+        'tunnel_action', choices=['start', 'stop', 'status'])
     logs = sub.add_parser('logs')
     logs.add_argument('--node', default='c04', choices=list(NODES))
     logs.add_argument('-n', type=int, default=60)
@@ -774,6 +910,13 @@ def main():
         return stop(cfg, args.force, args.drain_timeout) or start(cfg, args.no_wait)
     elif args.action == 'status':
         return status(cfg)
+    elif args.action == 'tunnel':
+        require_head(cfg)
+        if args.tunnel_action == 'start':
+            return tunnel_start(cfg)
+        if args.tunnel_action == 'stop':
+            return tunnel_stop()
+        return tunnel_status(cfg)
     elif args.action == 'logs':
         require_head(cfg)
         node = next(node for node in cfg['nodes'] if node['name'] == args.node)
