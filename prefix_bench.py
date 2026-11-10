@@ -6,7 +6,9 @@ whole conversation, so every turn after the first repeats a long prefix. Turns r
 (turn 1 of every session, then turn 2, ...) so a session is revisited only after all the others,
 the reuse distance that decides whether a prefix cache, and which tier of it, still holds it.
 Reports TTFT per turn, plus prefix-cache counters from /metrics when the server exports them.
-Requests carry no sampling overrides. Results go to .runs/bench/<label>.json.
+Documents are seeded by session index, so every run starts by flushing the prefix cache (an admin
+endpoint: .secrets/admin-api-key). Requests carry no sampling overrides. Results go to
+.runs/bench/<label>.json.
 
     prefix_bench.py <label> [--sessions 96] [--turns 3] [--doc-tokens 24000] [--concurrency 8]"""
 import argparse
@@ -56,6 +58,13 @@ class Client:
                     totals[key] = totals.get(key, 0.0) + float(value)
         return totals
 
+    def flush_cache(self):
+        admin = (ROOT / '.secrets/admin-api-key').read_text().strip()
+        req = urllib.request.Request(self.base + '/flush_cache?timeout=60', method='POST',
+                                     headers={'Authorization': 'Bearer ' + admin})
+        with OPENER.open(req, timeout=90) as response:
+            response.read()
+
     def turn(self, messages):
         """Stream one chat turn; return TTFT, the assistant message to send back, and usage."""
         body = {'model': self.model, 'messages': messages, 'stream': True, 'max_tokens': 256,
@@ -102,6 +111,7 @@ def main():
     parser.add_argument('--concurrency', type=int, default=8)
     args = parser.parse_args()
     client = Client()
+    client.flush_cache()
     # Size documents from one measured sample; distinct seeds keep sessions from sharing prefixes.
     _, _, usage = client.turn([{'role': 'user', 'content': document(random.Random(-1), 500)}])
     per_sentence = usage['prompt_tokens'] / 500

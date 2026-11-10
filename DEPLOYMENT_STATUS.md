@@ -1,9 +1,9 @@
 # Deployment status — 2026-11-10
 
 Kimi K3.1 Pro, TP16 · DCP16 across c04 (rank 0), c11, c13 and c14, on
-http://10.78.202.32:30000/v1 (model `kimi-k3.1-pro`). Stage 2 (DFLASH, 8 draft tokens, 262,144
-context) has served since 19:52 UTC and is published through frp on remote port 8313. Every item
-of the brief's validation checklist passes for stages 1 and 2.
+http://10.78.202.32:30000/v1 (model `kimi-k3.1-pro`). Stage 3 (DFLASH, 8 draft tokens, radix
+prefix cache without HiCache, 262,144 context) has served since 20:38 UTC and is published through
+frp on remote port 8313. Every item of the brief's validation checklist passes for all stages.
 
 | Stage | State |
 |---|---|
@@ -12,7 +12,7 @@ of the brief's validation checklist passes for stages 1 and 2.
 | Weights | downloaded on c04, rsynced, verified on all four nodes |
 | 1. Baseline launch | serving; functional checks, stress test and bench sweep pass |
 | 2. DFLASH | serving; functional checks, stress test and bench sweeps pass |
-| 3. HiCache | not started |
+| 3. Prefix cache | serving with the radix cache; HiCache tried and dropped at the user's decision |
 
 ## Pre-flight (2026-11-10 17:54 UTC)
 
@@ -113,8 +113,15 @@ c13 already had the identical uv Python, c14 got c04's earlier.
 
 `serving.json` binds `10.78.202.32:30000` (c04's bond0) rather than the brief's `0.0.0.0`:
 every c04 interface is private, but `0.0.0.0` would also listen on the 10.78.203.x management
-network. Nothing is published outside the cluster. The API key was generated with
-`kimictl init-key` into `.secrets/` (mode 0600; ds.deploy's secrets are not reused).
+network. The API key was generated with `kimictl init-key` into `.secrets/` (mode 0600;
+ds.deploy's secrets are not reused).
+
+With only `--api-key`, SGLang accepts that key on its admin endpoints too (weight updates, memory
+release, pause, profiling, `/flush_cache`), and the key is shared and published through frp. Since
+the 20:32 UTC restart a separate admin key (`.secrets/admin-api-key`, mode 0600, not shared) is
+set through the same auth config; the admin endpoints then accept only it. Checked: the API key
+gets 401 on an admin endpoint, the admin key passes auth there and gets 401 on `/v1/models`.
+`/health` and `/metrics` answer without a key (SGLang always allows them).
 
 ## Weights
 
@@ -219,9 +226,10 @@ TPOT is 10.1 ms against B300's 9.6 ms. All 424 requests succeeded; no errors in 
 ShutdownReq; every scheduler on all four nodes exited with status 0 within 2 s (no "still alive
 ... killing" warning), and each node saw its GPUs back at 2-6 MiB with no compute processes and
 recovery action None, 8.5 s in all. No processes were left. Rank 0 left three files in /dev/shm
-(two 24 MB SGLang message queues and a 16 KB load-stats file, about 48 MB of host RAM, named by
-PID so they cannot collide); they are outside `kimi.deploy/`, so they were left for the user to
-decide on. Preflight then flagged ports 30000 and 20000 as in use: only TIME-WAIT sockets from the
+(two SGLang message queues of 24 MB apparent size and a 16 KB load-stats file, named by PID so
+they cannot collide). The queues are sparse: each file holds one 64 KB page, so a run leaves
+192 KB of host RAM, not 48 MB. Every run of rank 0 leaves its set; the workers leave none. They are
+outside `kimi.deploy/`, so they were left for the user to decide on. Preflight then flagged ports 30000 and 20000 as in use: only TIME-WAIT sockets from the
 stop. Its bind test now sets SO_REUSEADDR like uvicorn and torch's TCPStore.
 
 ## Stage 2: DFLASH
@@ -276,6 +284,77 @@ GPQA). At concurrency 1, TPOT is 4.5 ms against stage 1's 10.1 ms, about 2.2x fa
 ITL counts per chunk, and each verify step emits about three tokens. Stage 1 was not run on this
 dataset, so the c8/c32 comparison is against its 8K/1K numbers only.
 
+## Stage 3: prefix cache
+
+### Trial with HiCache (20:11-20:31 UTC)
+
+`serving.json`: `radix_cache` on, plus the brief's HiCache flags (`--enable-hierarchical-cache
+--hicache-size 120 --hicache-io-backend direct --hicache-mem-layout page_first_direct
+--mamba-max-states-per-path 1`), with stage 2's DFLASH x8 and 32 running requests. Ready after
+381 s (`HiCache + DCP enabled (dcp_size=16)`).
+
+- GPU: the radix cache needs a KDA state per cached prefix, so the state pool grew from 32 slots
+  to 222 (5.63 GB per GPU) and the KV pool shrank from 14,323,712 tokens to 8,091,648 (505,728 per
+  rank, 8.91 GB).
+- Host, per rank: 3,972,096 KV tokens (62.54 GB; 63.55M logical tokens across DCP) and 2,047 KDA
+  states (57.49 GB). That is about 247 GiB of mlocked memory on each of Grace NUMA nodes 0 and 1,
+  per node (958 GiB in all), held by the processes and not as /dev/shm files, so the kernel frees
+  it at exit.
+- Warnings: KDA state copies use a synchronous torch fallback, and the `direct` backend's
+  copy-engine DMA "can queue ahead of the forward's small metadata host-to-device copies and stall
+  the forward" (the engine suggests `SGLANG_ENABLE_MLP_SYNC_METADATA_FILL=1`; not tried).
+
+Functional checks all passed (`.runs/smoke/20261110-121914.json`). The 32 x 8K/1K stress test
+right after startup completed 32/32 in 24.0 s (stage 2: 18.5 s): TTFT mean 11.3 s (5.5 s), TPOT
+mean 9.7 ms (9.8 ms), worst ITL 7.2 s (3.5 s). The first 8K prefill after startup took 7 s against
+3 s in stage 2; steady prefill was about 27K tok/s in both. The rest was not isolated.
+
+Prefix reuse (`prefix_bench.py`): 96 sessions, each with its own ~24K-token document, 3 turns
+sent turn-major (every session's turn 1, then every turn 2, ...), concurrency 8, `reasoning_effort`
+low and 256 output tokens. Turn k resends the whole conversation.
+
+| Turn | Stage 2, no cache: TTFT mean / p50 / p90 (s) | Stage 3 with HiCache: TTFT mean / p50 / p90 (s) |
+|---:|---:|---:|
+| 1 | 1.52 / 0.98 / 1.86 | 1.56 / 1.03 / 1.89 |
+| 2 | 2.25 / 1.88 / 3.51 | 0.60 / 0.65 / 0.94 |
+| 3 | 1.84 / 1.71 / 3.22 | 0.57 / 0.64 / 0.78 |
+| Run time | 306 s | 180 s |
+
+All 4,521,984 cached prompt tokens came from GPU memory (`cached_tokens_total{cache_source=
+"device"}`); HiCache copied 2.72M tokens (59 GB) per rank to host and loaded none back. The 96
+sessions (2.3M tokens, 96 KDA states) fit in GPU memory, so the gain is the radix cache's alone.
+The host tier only matters past about 8.1M cached tokens or about 200 cached conversations (one KDA
+state each). A larger test (320 sessions x 30K tokens) was stopped in its first turn at the user's
+request, after the host tier had served 400,384 prompt tokens; it has no latency figures, and its
+first 96 sessions partly hit the previous run's documents (same seeds; `prefix_bench.py` now
+flushes the cache first).
+
+Decision (user, 20:30 UTC): keep the radix cache, drop HiCache. It added host copy traffic, a
+possible forward stall and 494 GiB of locked RAM per node, and helps only for more live sessions
+than this deployment expects.
+
+Stop at 20:31 UTC: rank 0 drained 0 requests; every GPU came back at 4-9 MiB with no processes,
+and locked host memory fell to under 200 MB on c04 and 0 on the workers.
+
+### Radix cache only
+
+`serving.json`: `radix_cache` on with `--mamba-max-states-per-path 1` (each cached conversation
+keeps one KDA state: the tail), no HiCache flags. Restart at 20:32 UTC (`kimictl restart`): ready
+after 371 s. KDA state pool 221 slots (5.61 GB per GPU), KV pool 8,037,376 tokens (502,336 per
+rank, 8.85 GB), `hicache_attached=False`. No host pools; locked host memory stays under 200 MB.
+
+- Stress test right after startup (`.runs/bench/stage3-radix-stress-c32.log`): 32/32 in 24.0 s,
+  TTFT mean 11.5 s, TPOT mean 9.7 ms / p90 13.4 ms, worst ITL 3.5 s. TPOT and worst ITL match
+  stage 2 (9.8 ms, 3.5 s); the HiCache trial's 7.2 s worst ITL is gone. TTFT is still twice stage
+  2's 5.5 s: the first 8K prefill after startup took 8 s against 3 s, and the other 31 queued
+  behind it. It is a one-off cost of the first request with the radix cache on; later prefills
+  ran at stage 2's rate.
+- Functional checks all pass (`.runs/smoke/20261110-123913.json`), needle at 127,902 tokens in
+  5.3 s.
+
+The prefix-reuse gain measured in the trial came from this same device cache. No further
+benchmarks were run, at the user's request.
+
 ## Public access (frp)
 
 `kimictl tunnel start` at 19:55 UTC, once stage 2 passed its checks: config check (exactly the
@@ -287,13 +366,20 @@ URL on ssh.linsyking.com: http://127.0.0.1:8313/v1, model `kimi-k3.1-pro`; not t
 server side. c02's DeepSeek tunnel (remote 8312) was not touched. `kimictl stop` closes the tunnel
 before stopping the server; nothing restarts it automatically.
 
+The stop before the stage 3 trial closed it (20:10 UTC). Restarted at 20:39 UTC on the radix-only
+server, after its stress and functional checks; `tunnel start` now also refuses unless an admin
+endpoint rejects the API key. frpc logged `login to server success` and
+`[kimi-c04-30000-to-8313] start proxy success` (12:39:33 PST). No key or frp token appears in any
+log, doc, state file or commit.
+
 At the user's request the API key and the endpoint URL, and nothing else (no frp details), are
 in `/scratch_local/user_data/kimi-k3.1-pro-endpoint.txt`, mode 0644, readable by every user on c04.
 
 ## Next
 
-- Stage 2 (DFLASH) needs a stop and a start. Per the brief: 8 draft tokens with
-  `--max-running-requests` 32 for up to about 8 concurrent requests, 6 for 24-56. PR #48178 is
-  not in the branch; its routing is covered by the K3.1 DCP override (see Engine source), but a
-  DFLASH + DCP graph-capture stall is the main startup risk.
-- Revert `nccl_debug` to WARN at that restart; raise the context to 1,048,576 once stable.
+- `/dev/shm` on c04 holds rank 0's leftover queue files from three stopped runs (192 KB each run);
+  deleting them, now or in `kimictl stop`, waits on the user.
+- HiCache is worth another look only for more than about 200 live long conversations or more than
+  8M cached tokens; the context can go to 1,048,576 once the service has run stably.
+- A hard thinking budget would need `--enable-strict-thinking` (native `/generate` only) or a
+  custom logit processor, which has no Kimi preset; neither is enabled or tested.

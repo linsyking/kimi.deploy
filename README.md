@@ -7,6 +7,7 @@ protected by the key in `.secrets/api-key`. Tunable values are in `serving.json`
 
 - Checkpoint: moonshotai/Kimi-K3.1-Pro @ d9e99b0792a5e93b78ea9bea62a68167e36ddd9e (1.561 TB)
 - Draft (DFLASH, stage 2): RadixArk/Kimi-K3.1-Dflash2-Preview @ ea257b38a8ee755b65287bb8ccd0938b519ce26b
+- Serving: DFLASH x8, 32 running requests, radix prefix cache on (stage 3), no HiCache
 - Engine: SGLang `kimi-k3.1-day-0` @ 8b180ca9e07e, from source in a uv venv (no containers)
 
 Current state and measurements are in DEPLOYMENT_STATUS.md.
@@ -22,8 +23,11 @@ Run these on c04, in this directory:
     ./kimictl restart       # stop, then start only if every GPU came back free
     ./kimictl stop [--force] [--drain-timeout 600]
     ./kimictl sync          # push kimictl, serving.json and docs to the workers
+    ./kimictl tunnel start|stop|status   # frp publication on remote port 8313 (see below)
+    ./kimictl init-key      # create the API and admin keys (or add a missing admin key)
     ./smoke_test.py         # functional checks: health, models, effort tiers, tools, image, 128K needle
     ./bench.sh <label>      # bench_serving 8K in / 1K out at concurrency 1, 8, 32, 64
+    ./prefix_bench.py <label>  # multi-turn prefix reuse: TTFT per turn and cache counters
 
 Each node runs one rank in a tmux session (`kimi-c04` ... `kimi-c14`) on the node-local
 socket `.runs/kimi-tmux`, logging to `sglang.log` in this directory on that node; earlier
@@ -57,11 +61,17 @@ while 1 GiB or more of page cache sits in HBM.
 Edit `serving.json` and restart to change engine settings. `extra_args` and `extra_env`
 append raw SGLang flags and environment variables for experiments. Setting `speculative` to
 `{"algorithm": "DFLASH", "draft_model_path": "/scratch_local/user_data/yiming/models/Kimi-K3.1-Dflash2-Preview", "num_draft_tokens": 8}`
-enables stage-2 speculative decoding.
+enables stage-2 speculative decoding. `radix_cache: true` (stage 3) keeps prompt prefixes on the
+GPUs; with `--mamba-max-states-per-path 1` each cached conversation holds one KDA state, and
+SGLang sizes 221 state slots, which leaves 8.04M KV tokens (14.3M without the cache). HiCache, the
+host-RAM tier, was tried and dropped (DEPLOYMENT_STATUS.md). Both benchmark scripts flush the
+prefix cache before measuring.
 
 ## API
 
-Use model `kimi-k3.1-pro` with `Authorization: Bearer $(cat .secrets/api-key)`. At the
+Use model `kimi-k3.1-pro` with `Authorization: Bearer $(cat .secrets/api-key)`. SGLang's admin
+endpoints (`/flush_cache`, weight updates, memory release, pause, profiling) take only the admin
+key in `.secrets/admin-api-key`, which is not shared; `/health` and `/metrics` need no key. At the
 user's request the key and the endpoint URL (nothing else) are also published, readable by
 every user on c04, in `/scratch_local/user_data/kimi-k3.1-pro-endpoint.txt`. After `init-key` and a
 restart, rewrite that file too, or it will hand out a dead key. Sampling is
@@ -72,6 +82,17 @@ encoder (`encoding_k3.py`) accepts only the three above, so the request fails wi
 Reasoning and tool calls use the `kimi_k3` parsers; in
 multi-turn use send back the full assistant message, including `reasoning_content` and
 `tool_calls`. Images are accepted as input.
+
+## Public access (frp)
+
+`kimictl tunnel start` publishes the API through frp as the single rule `kimi-c04-30000-to-8313`:
+ssh.linsyking.com's loopback port 8313 forwards to 10.78.202.32:30000, so on that server the API is
+http://127.0.0.1:8313/v1. frpc (config `.secrets/frpc.toml`, mode 0600, which holds the frp token)
+dials the frp server through a local gost HTTP proxy on 127.0.0.1:18080 that resolves names over
+HTTPS; `tunnel start` starts gost if nothing listens there. It refuses unless the API is healthy,
+answers 401 without the key and keeps its admin endpoints from the API key, and it waits for
+`[kimi-c04-30000-to-8313] start proxy success` in `.runs/frpc.log`. `kimictl stop` closes the tunnel
+first; nothing restarts it. c02's DeepSeek tunnel (remote 8312) is separate and never touched.
 
 ## Environment
 
