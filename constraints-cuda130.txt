@@ -1,0 +1,9 @@
+# Keep the pip CUDA toolchain (CUDA_HOME=<site-packages>/nvidia/cu13) on the 13.0 series:
+# torch 2.14.1+cu130 ships cuda-toolkit 13.0.3, the k31 image JIT-compiles with the base image's
+# CUDA 13.0.3, and driver 580.167.08 supports CUDA 13.0. humming-kernels[cu13] leaves nvcc/cccl
+# unbounded, so without this the solve takes CUDA 13.5 compilers.
+nvidia-cuda-nvcc==13.0.*
+nvidia-cuda-crt==13.0.*
+nvidia-nvvm==13.0.*
+nvidia-nvjitlink==13.0.*
+nvidia-cuda-cccl==13.0.*
