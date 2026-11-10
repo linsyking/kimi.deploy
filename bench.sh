@@ -6,6 +6,9 @@
 #   DATASET=sharegpt: real ShareGPT first turns as chat requests (reasoning at the model's default)
 #     that stop on their own, output capped at OUTPUT_LEN; use it for acceptance on natural text.
 # Acceptance length is the run's generated tokens per verify step, from rank 0's /metrics counters.
+# Each run starts from an empty prefix cache (/flush_cache, an admin endpoint) and skips
+# bench_serving's warmup request, so repeated seeded prompts don't hit the radix cache.
+# FLUSH_KEY_FILE overrides the key for a server started before .secrets/admin-api-key existed.
 # Results: .runs/bench/<label>-c<N>.{jsonl,log,accept}
 #
 #   bench.sh <label> [concurrency ...]      default concurrencies: 1 8 32 64
@@ -34,6 +37,7 @@ fi
 mkdir -p "$OUT"
 OPENAI_API_KEY=$(cat "$ROOT/.secrets/api-key")
 export OPENAI_API_KEY HF_HUB_OFFLINE=1
+FLUSH_KEY=$(cat "${FLUSH_KEY_FILE:-$ROOT/.secrets/admin-api-key}")
 
 case $DATASET in
     random) WORKLOAD=(--backend sglang --dataset-name random --random-input-len "$INPUT_LEN"
@@ -52,11 +56,13 @@ for c in "${CONCURRENCY[@]}"; do
     prompts=$(( c * 4 > 8 ? c * 4 : 8 ))
     name=$OUT/$LABEL-c$c
     echo "== $LABEL: $DATASET, concurrency $c, $prompts prompts"
+    curl -sf --noproxy '*' -m 90 -X POST -H "Authorization: Bearer $FLUSH_KEY" \
+        "http://$HOST:$PORT/flush_cache?timeout=60" > /dev/null || { echo "flush_cache failed" >&2; exit 1; }
     tokens=$(counter sglang:generation_tokens_total); verifies=$(counter sglang:spec_verify_calls_total)
     # A run that outlives this bound is treated as a hang; the server itself is left alone.
     timeout 3600 "$ROOT/.venvs/sglang/bin/python" -m sglang.benchmark.serving \
         --base-url "http://$HOST:$PORT" --model "$MODEL" --tokenizer "$MODEL_PATH" \
-        --dataset-path "$SHAREGPT" "${WORKLOAD[@]}" --num-prompts "$prompts" --max-concurrency "$c" \
+        --dataset-path "$SHAREGPT" "${WORKLOAD[@]}" --num-prompts "$prompts" --max-concurrency "$c" --warmup-requests 0 \
         --output-file "$name.jsonl" > "$name.log" 2>&1 || {
         echo "bench at concurrency $c failed or timed out; see $name.log" >&2
         exit 1

@@ -41,6 +41,9 @@ NUMACTL = Path(SCRATCH_HOME) / '.local/opt/sysutils/bin/numactl'
 SOCKET = RUNS / 'kimi-tmux'
 PRIVATE = ROOT / '.secrets'
 API_KEY = PRIVATE / 'api-key'
+# Without an admin key SGLang lets the API key call its admin endpoints (weight updates, memory
+# release, pause); with one set they take only the admin key, which is never shared.
+ADMIN_KEY = PRIVATE / 'admin-api-key'
 AUTH_CONFIG = PRIVATE / 'sglang-auth.yaml'
 # frp publishes the API on the frp server's loopback only; c02's DeepSeek tunnel owns remote 8312.
 FRPC = LOCAL_BIN / 'frpc'
@@ -71,16 +74,22 @@ OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 def redact_log_records():
     # SGLang logs server_args, api_key included. Also runs when multiprocessing imports this
     # entrypoint in scheduler processes.
-    key = API_KEY.read_text().strip() if API_KEY.exists() else ''
-    if not key:
+    keys = [path.read_text().strip() for path in (API_KEY, ADMIN_KEY) if path.exists()]
+    keys = [key for key in keys if key]
+    if not keys:
         return
+
+    def redact(text):
+        for key in keys:
+            text = text.replace(key, '<redacted>')
+        return text
 
     class RedactedStream:
         def __init__(self, stream):
             self.stream = stream
 
         def write(self, value):
-            self.stream.write(value.replace(key, '<redacted>'))
+            self.stream.write(redact(value))
             return len(value)
 
         def flush(self):
@@ -96,8 +105,8 @@ def redact_log_records():
     def factory(*args, **kwargs):
         record = previous(*args, **kwargs)
         message = record.getMessage()
-        if key in message:
-            record.msg, record.args = message.replace(key, '<redacted>'), ()
+        if any(key in message for key in keys):
+            record.msg, record.args = redact(message), ()
         return record
 
     logging.setLogRecordFactory(factory)
@@ -303,7 +312,7 @@ def node_preflight(cfg, rank):
     required = [VENV / 'bin/python', VENV / 'kimi-build.json', TMUX, NUMACTL]
     required += [root / VERIFIED for root in model_dirs(cfg)]
     if rank == 0:
-        required += [API_KEY, AUTH_CONFIG]
+        required += [API_KEY, ADMIN_KEY, AUTH_CONFIG]
     problems += [f'missing {path}' for path in required if not path.exists()]
     gpus, apps = gpu_report()
     if len(gpus) != 4:
@@ -553,15 +562,31 @@ def healthy(cfg):
 
 
 def init_key():
-    if API_KEY.exists() or AUTH_CONFIG.exists():
-        raise RuntimeError(f'{PRIVATE} already holds a key; remove it deliberately to rotate')
+    """Create the API key and the admin key, or add the admin key to an existing API key."""
+    if ADMIN_KEY.exists():
+        raise RuntimeError(f'{PRIVATE} already holds both keys; remove them deliberately to rotate')
     PRIVATE.mkdir(mode=0o700, exist_ok=True)
-    key = 'sk-kimi-' + secrets.token_urlsafe(32)
-    for path, text in ((API_KEY, key + '\n'), (AUTH_CONFIG, f'api-key: {key}\n')):
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        with os.fdopen(fd, 'w') as handle:
-            handle.write(text)
-    print(f'Created {API_KEY} and {AUTH_CONFIG} (mode 0600).')
+    created = []
+    if API_KEY.exists():
+        key = API_KEY.read_text().strip()
+    else:
+        key = 'sk-kimi-' + secrets.token_urlsafe(32)
+        write_secret(API_KEY, key + '\n')
+        created.append(API_KEY)
+    admin = 'sk-kimi-admin-' + secrets.token_urlsafe(32)
+    write_secret(ADMIN_KEY, admin + '\n')
+    write_secret(AUTH_CONFIG, f'api-key: {key}\nadmin-api-key: {admin}\n')
+    created += [ADMIN_KEY, AUTH_CONFIG]
+    print(f'Wrote {", ".join(map(str, created))} (mode 0600); a running server picks them up on restart.')
+
+
+def write_secret(path, text):
+    # Write beside the target and rename, so a reader never sees a partial file.
+    temp = path.with_name(path.name + '.tmp')
+    fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, 'w') as handle:
+        handle.write(text)
+    os.replace(temp, path)
 
 
 def sync(cfg):
@@ -764,6 +789,15 @@ def require_authenticated_api(cfg):
     except urllib.error.HTTPError as error:
         if error.code != 401:
             raise RuntimeError(f'expected HTTP 401 without the API key, got {error.code}') from error
+    # A read-only admin endpoint: the shared API key must not reach the admin surface.
+    admin = urllib.request.Request(f'http://{cfg["bind_host"]}:{cfg["port"]}/list_external_corpora',
+                                   headers=auth_headers())
+    try:
+        with OPENER.open(admin, timeout=10):
+            raise RuntimeError('refusing to expose an API whose key also opens the admin endpoints')
+    except urllib.error.HTTPError as error:
+        if error.code != 401:
+            raise RuntimeError(f'expected HTTP 401 for an admin endpoint with the API key, got {error.code}') from error
 
 
 def start_gost():

@@ -23,5 +23,5 @@
   "startup_timeout_seconds": 3600,
   "nccl_debug": "WARN",
   "extra_env": {},
-  "extra_args": ["--enable-hierarchical-cache", "--hicache-size", "120", "--hicache-io-backend", "direct", "--hicache-mem-layout", "page_first_direct", "--mamba-max-states-per-path", "1"]
+  "extra_args": ["--mamba-max-states-per-path", "1"]
 }

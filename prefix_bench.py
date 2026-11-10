@@ -14,6 +14,7 @@ import concurrent.futures
 import json
 from pathlib import Path
 import random
+import re
 import statistics
 import sys
 import time
@@ -37,15 +38,22 @@ class Client:
                         'Content-Type': 'application/json'}
 
     def metrics(self):
+        """Counter totals, split by cache source or host pool. Series that carry a tp_rank label
+        repeat one logical count per rank (HiCache backup, load-back), so only TP0's is kept."""
         req = urllib.request.Request(self.base + '/metrics', headers=self.headers)
         totals = {}
         with OPENER.open(req, timeout=30) as response:
             for line in response.read().decode().splitlines():
                 if line.startswith('sglang:') and not line.startswith('#'):
                     name, _, value = line.rpartition(' ')
-                    key = name.split('{', 1)[0]
-                    if key.endswith('_total'):
-                        totals[key] = totals.get(key, 0.0) + float(value)
+                    key, _, labels = name.partition('{')
+                    labels = dict(re.findall(r'(\w+)="([^"]*)"', labels))
+                    if not key.endswith('_total') or labels.get('tp_rank', '0') != '0':
+                        continue
+                    for label in ('cache_source', 'pool'):
+                        if label in labels:
+                            key += f'{{{label}="{labels[label]}"}}'
+                    totals[key] = totals.get(key, 0.0) + float(value)
         return totals
 
     def turn(self, messages):
@@ -120,7 +128,7 @@ def main():
     elapsed = time.monotonic() - started
     after = client.metrics()
     counters = {key: after[key] - before.get(key, 0.0) for key in sorted(after)
-                if any(word in key for word in ('cache', 'hicache', 'prompt_tokens', 'generation_tokens'))
+                if any(word in key for word in ('cache', 'load_back', 'prompt_tokens', 'generation_tokens'))
                 and after[key] != before.get(key, 0.0)}
     result = {'label': args.label, 'sessions': args.sessions, 'turns_per_session': args.turns,
               'doc_tokens': args.doc_tokens, 'concurrency': args.concurrency, 'elapsed_s': round(elapsed, 1),
