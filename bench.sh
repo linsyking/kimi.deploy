@@ -44,3 +44,16 @@ for c in "${CONCURRENCY[@]}"; do
     }
     sed -n '/Serving Benchmark Result/,/^=\+$/p' "$name.log" | tail -n +2
 done
+
+python3 - "$OUT" "$LABEL" "${CONCURRENCY[@]}" <<'EOF'
+import json, sys
+out, label, *levels = sys.argv[1:]
+print('| Concurrency | Requests | TTFT mean / p90 (ms) | TPOT mean / p90 (ms) | Output tok/s | Total tok/s | Accept length |')
+print('|---:|---:|---:|---:|---:|---:|---:|')
+for c in levels:
+    r = json.loads(open(f'{out}/{label}-c{c}.jsonl').read().splitlines()[-1])
+    accept = f'{r["accept_length"]:.2f}' if r.get('accept_length') else '-'
+    print(f'| {c} | {r["completed"]} | {r["mean_ttft_ms"]:,.0f} / {r["p90_ttft_ms"]:,.0f} | '
+          f'{r["mean_tpot_ms"]:.1f} / {r["p90_tpot_ms"]:.1f} | {r["output_throughput"]:,.0f} | '
+          f'{r["total_throughput"]:,.0f} | {accept} |')
+EOF
