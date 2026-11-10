@@ -1,8 +1,9 @@
 # Deployment status — 2026-11-10
 
-Kimi K3.1 Pro, TP16 · DCP16 across c04 (rank 0), c11, c13 and c14. Serving since 19:24 UTC
-on http://10.78.202.32:30000/v1 (model `kimi-k3.1-pro`), stage 1 (plain decoding, 262,144
-context). Every item of the brief's validation checklist passes for this stage.
+Kimi K3.1 Pro, TP16 · DCP16 across c04 (rank 0), c11, c13 and c14, on
+http://10.78.202.32:30000/v1 (model `kimi-k3.1-pro`). Stage 2 (DFLASH, 8 draft tokens, 262,144
+context) has served since 19:52 UTC and is published through frp on remote port 8313. Every item
+of the brief's validation checklist passes for stages 1 and 2.
 
 | Stage | State |
 |---|---|
@@ -10,7 +11,7 @@ context). Every item of the brief's validation checklist passes for this stage.
 | Environment (venv) | built on c04, replicated and verified on all four nodes |
 | Weights | downloaded on c04, rsynced, verified on all four nodes |
 | 1. Baseline launch | serving; functional checks, stress test and bench sweep pass |
-| 2. DFLASH | not started |
+| 2. DFLASH | serving; functional checks, stress test and bench sweeps pass |
 | 3. HiCache | not started |
 
 ## Pre-flight (2026-11-10 17:54 UTC)
@@ -211,6 +212,83 @@ The brief's only reference is B300 1P1D decode at 8K context and batch 64: 2,583
 scheduler log, with ITL p90 25.2 ms, so the GB200 TP16 · DCP16 decode step matches it; the
 lower end-to-end output rate comes from serving prefill on the same server. At concurrency 1,
 TPOT is 10.1 ms against B300's 9.6 ms. All 424 requests succeeded; no errors in any log.
+
+## Stop between stages
+
+`kimictl stop` at 19:44 UTC, idle server: rank 0 took SIGTERM, drained 0 requests and broadcast
+ShutdownReq; every scheduler on all four nodes exited with status 0 within 2 s (no "still alive
+... killing" warning), and each node saw its GPUs back at 2-6 MiB with no compute processes and
+recovery action None, 8.5 s in all. No processes were left. Rank 0 left three files in /dev/shm
+(two 24 MB SGLang message queues and a 16 KB load-stats file, about 48 MB of host RAM, named by
+PID so they cannot collide); they are outside `kimi.deploy/`, so they were left for the user to
+decide on. Preflight then flagged ports 30000 and 20000 as in use: only TIME-WAIT sockets from the
+stop. Its bind test now sets SO_REUSEADDR like uvicorn and torch's TCPStore.
+
+## Stage 2: DFLASH
+
+`serving.json`: `speculative` = DFLASH with the RadixArk/Kimi-K3.1-Dflash2-Preview draft and 8
+draft tokens (`--speculative-draft-attention-backend cutedsl_mla --speculative-draft-kv-cache-dtype
+fp8_e4m3 --speculative-use-block-verification --enable-linear-replayssm-spec`), and
+`--max-running-requests` 32, the brief's setting for width 8 (the draft card lowers it to 32 at
+width 8 because the speculative KDA state cache grows with width x requests). `NCCL_DEBUG` back to
+WARN.
+
+Launch (19:45 UTC): ready after 422 s. Target weights 263 s, draft weights 0.6 s, target-verify
+CUDA graphs for batch 1-32 in 39 s, draft graphs in 24 s; no capture stall (see Engine source for
+why PR #48178 does not apply). SGLang logged the expected `DFLASH block size mismatch: using
+speculative_num_draft_tokens=8 but draft config block_size=5`, the DFLASH draft KV ring (66 rows
+per request per rank), KDA verify on `nv_cutedsl` and DSA attention on `flashmla_kv`. KV pool:
+14,323,712 tokens (15.77 GB per GPU); KDA state pool: 32 slots.
+
+Functional checks all pass again (`.runs/smoke/20261110-115500.json`): health, models, effort low
+and max, tool call round trip, image, and the needle at 127,902 tokens (5.2 s). The 32 x 8K/1K
+stress test right after startup finished in 18.5 s (30.1 s in stage 1), all 32 requests, no stall.
+
+Benchmarks. Acceptance length is the run's generated tokens per verify step, from `/metrics`
+counter deltas (the server's own average is cumulative since startup).
+
+Fixed 8K input / 1K output (`bench.sh stage2`), comparable with stage 1:
+
+| Concurrency | Requests | TTFT mean / p90 (ms) | TPOT mean / p90 (ms) | ITL p90 (ms) | Output tok/s | Total tok/s | Accept length |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 8 | 343 / 349 | 1.9 / 2.1 | 2.0 | 446 | 4,013 | 7.39 |
+| 8 | 32 | 1,244 / 1,918 | 4.6 / 6.5 | 4.3 | 1,233 | 11,097 | 7.26 |
+| 32 | 128 | 4,195 / 7,420 | 10.7 / 13.5 | 5.4 | 2,064 | 18,574 | 7.59 |
+| 64 | 256 | 17,297 / 21,735 | 11.5 / 13.6 | 6.4 | 2,066 | 18,598 | 7.60 |
+
+These overstate DFLASH: the random dataset repeats a short ShareGPT prompt up to 8K tokens, the
+output turns repetitive, and the draft is accepted almost every step (7.3-7.6 of 8). At
+concurrency 64, half the requests queue behind the 32-request cap, so throughput stays at the
+c32 level.
+
+Natural text (`DATASET=sharegpt OUTPUT_LEN=2048 bench.sh stage2-sharegpt 1 8 32`): real ShareGPT
+first turns as chat requests, reasoning at the model's default (max), stopping on their own up to
+2,048 tokens:
+
+| Concurrency | Requests | TTFT mean / p90 (ms) | TPOT mean / p90 (ms) | ITL p90 (ms) | Output tok/s | Total tok/s | Accept length |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 8 | 262 / 269 | 4.5 / 5.6 | 13.3 | 215 | 244 | 2.74 |
+| 8 | 32 | 348 / 508 | 7.7 / 10.8 | 24.1 | 921 | 1,127 | 2.89 |
+| 32 | 128 | 1,984 / 3,555 | 12.0 / 17.8 | 39.9 | 2,217 | 2,587 | 2.92 |
+
+Acceptance on mixed chat is 2.7-2.9, below the draft card's 3.4-5.8 at width 8 (GSM8K, AIME26,
+GPQA). At concurrency 1, TPOT is 4.5 ms against stage 1's 10.1 ms, about 2.2x faster per user;
+ITL counts per chunk, and each verify step emits about three tokens. Stage 1 was not run on this
+dataset, so the c8/c32 comparison is against its 8K/1K numbers only.
+
+## Public access (frp)
+
+`kimictl tunnel start` at 19:55 UTC, once stage 2 passed its checks: config check (exactly the
+`kimi-c04-30000-to-8313` rule, targeting 10.78.202.32:30000), API healthy and 401 without the key,
+`frpc verify`, gost started on 127.0.0.1:18080 and a DNS-over-HTTPS lookup through it, then frpc:
+`login to server success` and `[kimi-c04-30000-to-8313] start proxy success`. frpc and gost each
+lead their own session; the frp token appears in no log, state file, doc or commit. Server-local
+URL on ssh.linsyking.com: http://127.0.0.1:8313/v1, model `kimi-k3.1-pro`; not tested from the frp
+server side. c02's DeepSeek tunnel (remote 8312) was not touched. `kimictl stop` closes the tunnel
+before stopping the server; nothing restarts it automatically.
+
+At the user's request the API key, URL and model name are in
+`/scratch_local/user_data/kimi-k3.1-pro-endpoint.txt`, mode 0644, readable by every user on c04.
 
 ## Next
 
