@@ -51,7 +51,15 @@ claude were not installed there; the deployment does not need them.
 - PR #48178 (route DFLASH target verify to cutedsl_mla under DCP) is not merged into the
   branch, but it targets the Kimi-K3 override path. The branch's K3.1 DCP override already
   forces `speculative_draft_attention_backend=cutedsl_mla` and `speculative_attention_mode=decode`
-  for DFLASH (`arg_groups/model_overrides/kimi_k3.py`, `_kimi_k31_dcp_overrides`).
+  for DFLASH (`arg_groups/model_overrides/kimi_k3.py`, `_kimi_k31_dcp_overrides`). The PR's bug:
+  under DCP, K3's override sent DFLASH target verify to the prefill kernel (`trtllm_mla`), which
+  cannot take the global causal bound that verifying several draft tokens over DCP-sharded KV
+  needs; DSPARK and EAGLE3 were already routed to decode. The unfixed K3 override is registered
+  for `KimiK3ForConditionalGeneration` only. Checked offline with the stage-2 flags (8 draft
+  tokens, no GPU visible, `.runs/dryrun_dflash_resolved.py`): the K3.1 override dispatch declares
+  `speculative_attention_mode=decode` and `cutedsl_mla`, and no later hook rewrites the mode.
+  SGLang records overrides as declarations, so the server_args dump in `sglang.log` shows the raw
+  input (`'speculative_attention_mode': 'prefill'`), not the resolved value.
 - Every flag the brief marked untested exists: `--dcp-size`, `--mamba-ssm-dtype`,
   `--enable-linear-replayssm-spec`, `--speculative-use-block-verification`,
   `--speculative-draft-attention-backend`, `--speculative-draft-kv-cache-dtype`,
