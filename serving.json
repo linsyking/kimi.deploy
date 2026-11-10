@@ -17,11 +17,11 @@
   "mem_fraction_static": 0.85,
   "kv_cache_dtype": "fp8_e4m3",
   "mamba_ssm_dtype": "float32",
-  "radix_cache": false,
+  "radix_cache": true,
   "speculative": {"algorithm": "DFLASH", "draft_model_path": "/scratch_local/user_data/yiming/models/Kimi-K3.1-Dflash2-Preview", "num_draft_tokens": 8},
   "watchdog_timeout": 3600,
   "startup_timeout_seconds": 3600,
   "nccl_debug": "WARN",
   "extra_env": {},
-  "extra_args": []
+  "extra_args": ["--enable-hierarchical-cache", "--hicache-size", "120", "--hicache-io-backend", "direct", "--hicache-mem-layout", "page_first_direct", "--mamba-max-states-per-path", "1"]
 }
