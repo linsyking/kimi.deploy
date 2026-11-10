@@ -1,0 +1,37 @@
+{
+ "repo": "RadixArk/Kimi-K3.1-Dflash2-Preview",
+ "revision": "ea257b38a8ee755b65287bb8ccd0938b519ce26b",
+ "gated": false,
+ "files": [
+  {
+   "path": ".gitattributes",
+   "size": 1519,
+   "sha256": null,
+   "blob_id": "a6344aac8c09253b3b630fb776ae94478aa0275b"
+  },
+  {
+   "path": "LICENSE",
+   "size": 11358,
+   "sha256": null,
+   "blob_id": "d645695673349e3947e8e5ae42332d0ac3164cd7"
+  },
+  {
+   "path": "README.md",
+   "size": 5846,
+   "sha256": null,
+   "blob_id": "5480228dc0c0731242d2cf6fe3d11d048152e573"
+  },
+  {
+   "path": "config.json",
+   "size": 2050,
+   "sha256": null,
+   "blob_id": "7e0770647fc96d52eaf73949aa6fad384f22959e"
+  },
+  {
+   "path": "model.safetensors",
+   "size": 5569631720,
+   "sha256": "1e07d2352fc44ea3967862309abeaa670faa3cf386c37adc35b8c97396f27b3f",
+   "blob_id": "76294206b5c9cf942b58e8600cfafcebaf1e2afd"
+  }
+ ]
+}
