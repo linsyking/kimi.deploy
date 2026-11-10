@@ -1,0 +1,656 @@
+#!/usr/bin/env python3
+"""Control the Kimi K3.1 Pro SGLang service: one TP16 server across c04, c11, c13 and c14.
+
+Run it on c04 (rank 0, which serves the HTTP API). Each node runs one engine rank in a tmux
+session on a node-local socket. c04 drives the other nodes over SSH with absolute paths; the
+underscore subcommands are the node-local halves it invokes there."""
+import argparse
+import concurrent.futures
+import contextlib
+import datetime
+import fcntl
+import json
+import logging
+import os
+from pathlib import Path
+import pwd
+import secrets
+import shlex
+import signal
+import socket
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+import xml.etree.ElementTree as ET
+
+ROOT = Path(__file__).resolve().parent
+CONFIG_PATH = ROOT / 'serving.json'
+RUNS = ROOT / '.runs'
+STATE = RUNS / 'service.json'
+LOG = ROOT / 'sglang.log'
+VENV = ROOT / '.venvs/sglang'
+SCRATCH_HOME = '/scratch_local/user_data/yiming'
+LOCAL_BIN = Path(SCRATCH_HOME) / '.local/bin'
+TMUX = LOCAL_BIN / 'tmux'
+RSYNC = LOCAL_BIN / 'rsync'
+SOCKET = RUNS / 'kimi-tmux'
+PRIVATE = ROOT / '.secrets'
+API_KEY = PRIVATE / 'api-key'
+AUTH_CONFIG = PRIVATE / 'sglang-auth.yaml'
+VERIFIED = '.kimi-verified.json'
+RUNTIME_FILES = ['kimictl', 'serving.json', 'verify_venv.py', 'README.md', 'DEPLOYMENT_STATUS.md', '.gitignore']
+# The only nodes this deployment may use, in rank order: name -> (bond0 IP, hostname).
+NODES = {
+    'c04': ('10.78.202.32', 's04-p1-dgx-02-c04'),
+    'c11': ('10.78.202.39', 's04-p1-dgx-02-c11'),
+    'c13': ('10.78.202.41', 's04-p1-dgx-02-c13'),
+    'c14': ('10.78.202.42', 's04-p1-dgx-02-c14'),
+}
+SSH = ['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10']
+OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+def redact_log_records():
+    # SGLang logs server_args, api_key included. Also runs when multiprocessing imports this
+    # entrypoint in scheduler processes.
+    key = API_KEY.read_text().strip() if API_KEY.exists() else ''
+    if not key:
+        return
+
+    class RedactedStream:
+        def __init__(self, stream):
+            self.stream = stream
+
+        def write(self, value):
+            self.stream.write(value.replace(key, '<redacted>'))
+            return len(value)
+
+        def flush(self):
+            return self.stream.flush()
+
+        def __getattr__(self, name):
+            return getattr(self.stream, name)
+
+    sys.stderr = RedactedStream(sys.stderr)
+    sys.stdout = RedactedStream(sys.stdout)
+    previous = logging.getLogRecordFactory()
+
+    def factory(*args, **kwargs):
+        record = previous(*args, **kwargs)
+        message = record.getMessage()
+        if key in message:
+            record.msg, record.args = message.replace(key, '<redacted>'), ()
+        return record
+
+    logging.setLogRecordFactory(factory)
+
+
+redact_log_records()
+
+
+def config():
+    cfg = json.loads(CONFIG_PATH.read_text())
+    names = [node['name'] for node in cfg['nodes']]
+    if names != list(NODES):
+        raise RuntimeError(f'nodes must be {list(NODES)} in rank order; got {names}')
+    for node in cfg['nodes']:
+        if (node['host'], node['hostname']) != NODES[node['name']]:
+            raise RuntimeError(f'{node["name"]} must be {NODES[node["name"]]}')
+    if cfg['tp_size'] != 4 * len(cfg['nodes']):
+        raise ValueError('tp_size must be 4 GPUs per node')
+    if cfg['tp_size'] % cfg['dcp_size']:
+        raise ValueError('dcp_size must divide tp_size')
+    if not 0 < cfg['mem_fraction_static'] < 1:
+        raise ValueError('mem_fraction_static must be between zero and one')
+    spec = cfg.get('speculative')
+    if spec is not None and spec.get('algorithm') != 'DFLASH':
+        raise ValueError('speculative must be null or a DFLASH block')
+    return cfg
+
+
+def head(cfg):
+    return cfg['nodes'][0]
+
+
+def this_rank(cfg):
+    hostname = socket.gethostname().split('.')[0]
+    for rank, node in enumerate(cfg['nodes']):
+        if node['hostname'] == hostname:
+            return rank
+    raise RuntimeError(f'{hostname} is not one of the configured nodes')
+
+
+def run(command, **kwargs):
+    return subprocess.run([str(v) for v in command], check=True, text=True, capture_output=True, **kwargs)
+
+
+def tmux(*args, check=True):
+    return subprocess.run([str(TMUX), '-S', str(SOCKET), *map(str, args)], check=check, text=True,
+                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def session_name(cfg):
+    return 'kimi-' + cfg['nodes'][this_rank(cfg)]['name']
+
+
+def session_exists(cfg):
+    return tmux('has-session', '-t', session_name(cfg), check=False).returncode == 0
+
+
+def proc_info(pid):
+    try:
+        fields = Path(f'/proc/{pid}/stat').read_text().rpartition(')')[2].split()
+        return {'pid': int(pid), 'state': fields[0], 'pgid': int(fields[2]), 'start_ticks': fields[19]}
+    except (FileNotFoundError, ProcessLookupError, PermissionError):
+        return None
+
+
+def group_members(pgid):
+    found = []
+    for path in Path('/proc').iterdir():
+        if path.name.isdigit():
+            item = proc_info(path.name)
+            if item and item['pgid'] == pgid and item['state'] != 'Z':
+                found.append(item)
+    return found
+
+
+def tracked_state():
+    return json.loads(STATE.read_text()) if STATE.exists() else None
+
+
+def state_is_alive(state):
+    if not state:
+        return False
+    info = proc_info(state['pid'])
+    return bool(info and info['state'] != 'Z' and info['start_ticks'] == state['start_ticks'])
+
+
+@contextlib.contextmanager
+def locked(name):
+    RUNS.mkdir(exist_ok=True)
+    with (RUNS / f'{name}.lock').open('a') as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        yield
+
+
+# ----- node-local actions (run on every node) -----
+
+def gpu_report():
+    xml = run(['nvidia-smi', '-q', '-x'], timeout=30).stdout
+    gpus = []
+    for gpu in ET.fromstring(xml).findall('gpu'):
+        def field(path):
+            return (gpu.findtext(path) or 'Unknown').strip()
+        gpus.append({
+            'recovery_action': field('gpu_recovery_action'),
+            'fabric_state': field('fabric/state'),
+            'fabric_status': field('fabric/status'),
+            'fabric_health': field('fabric/health/summary'),
+            'memory_used_mib': int(used) if (used := field('fb_memory_usage/used').split()[0]).isdigit() else -1,
+        })
+    apps = run(['nvidia-smi', '--query-compute-apps=pid,process_name,used_memory', '--format=csv,noheader'],
+               timeout=30).stdout.strip()
+    return gpus, apps.splitlines() if apps else []
+
+
+def other_users():
+    me = os.getuid()
+    uids = set()
+    for path in Path('/proc').iterdir():
+        if path.name.isdigit():
+            with contextlib.suppress(FileNotFoundError):
+                uid = path.stat().st_uid
+                if uid >= 1000 and uid not in (me, 65534):
+                    uids.add(uid)
+    names = []
+    for uid in sorted(uids):
+        try:
+            names.append(pwd.getpwuid(uid).pw_name)
+        except KeyError:
+            names.append(str(uid))
+    return names
+
+
+def port_free(host, port):
+    probe = socket.socket()
+    try:
+        probe.bind((host, port))
+        return True
+    except OSError:
+        return False
+    finally:
+        probe.close()
+
+
+def runtime_digests():
+    import hashlib
+    return {name: hashlib.sha256((ROOT / name).read_bytes()).hexdigest()
+            for name in RUNTIME_FILES if (ROOT / name).exists()}
+
+
+def node_preflight(cfg, rank):
+    """Problems block a start; warnings are reported only."""
+    problems, warnings = [], []
+    required = [VENV / 'bin/python', VENV / 'kimi-build.json', TMUX,
+                Path(cfg['model_path']) / VERIFIED]
+    if cfg.get('speculative'):
+        required.append(Path(cfg['speculative']['draft_model_path']) / VERIFIED)
+    if rank == 0:
+        required += [API_KEY, AUTH_CONFIG]
+    problems += [f'missing {path}' for path in required if not path.exists()]
+    gpus, apps = gpu_report()
+    if len(gpus) != 4:
+        problems.append(f'expected 4 GPUs, found {len(gpus)}')
+    for index, gpu in enumerate(gpus):
+        if gpu['recovery_action'] != 'None':
+            problems.append(f'GPU {index} recovery action is {gpu["recovery_action"]}')
+        if (gpu['fabric_state'], gpu['fabric_status'], gpu['fabric_health']) != ('Completed', 'Success', 'Healthy'):
+            problems.append(f'GPU {index} fabric is {gpu["fabric_state"]}/{gpu["fabric_status"]}/{gpu["fabric_health"]}')
+        if not 0 <= gpu['memory_used_mib'] <= 1024:
+            problems.append(f'GPU {index} memory use is {gpu["memory_used_mib"]} MiB (-1: unreadable)')
+    if apps:
+        problems.append('GPUs have compute processes: ' + '; '.join(apps))
+    imex = subprocess.run(['systemctl', 'is-active', 'nvidia-imex'], text=True, capture_output=True).stdout.strip()
+    if imex != 'active':
+        problems.append(f'nvidia-imex is {imex or "unknown"}')
+    if rank == 0:
+        for port in (cfg['port'], cfg['dist_init_port']):
+            if not port_free(cfg['bind_host'] if port == cfg['port'] else head(cfg)['host'], port):
+                problems.append(f'port {port} is in use')
+    users = other_users()
+    if users:
+        warnings.append('other users have processes here: ' + ', '.join(users))
+    return {'problems': problems, 'warnings': warnings, 'gpus': gpus, 'digests': runtime_digests()}
+
+
+def launch_environment(cfg):
+    site = next((VENV / 'lib').glob('python*/site-packages'))
+    cuda = site / 'nvidia/cu13'
+    cache = RUNS / 'kernel-cache/sglang'
+    env = {key: value for key, value in os.environ.items()
+           if key not in ('HF_TOKEN', 'NCCL_DEBUG_SUBSYS', 'http_proxy', 'https_proxy', 'all_proxy',
+                          'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'PYTHONPATH', 'VIRTUAL_ENV')}
+    env.update(
+        # Non-interactive SSH sets HOME to the NFS home; keep every default cache on scratch.
+        HOME=SCRATCH_HOME, CUDA_HOME=str(cuda), CUDA_PATH=str(cuda),
+        PATH=f'{cuda}/bin:{VENV}/bin:{LOCAL_BIN}:/usr/local/bin:/usr/bin:/bin',
+        LD_LIBRARY_PATH=':'.join(filter(None, [f'{cuda}/lib', env.get('LD_LIBRARY_PATH')])),
+        TMPDIR=str(RUNS / 'tmp'), HF_HOME=f'{SCRATCH_HOME}/.cache/huggingface',
+        HF_HUB_OFFLINE='1', HF_HUB_DISABLE_TELEMETRY='1', TOKENIZERS_PARALLELISM='false',
+        OMP_NUM_THREADS='8', CUDA_VISIBLE_DEVICES='0,1,2,3', NCCL_DEBUG=cfg.get('nccl_debug', 'WARN'),
+        XDG_CACHE_HOME=str(cache / '.cache'), SGLANG_CACHE_DIR=str(cache / '.cache/sglang'),
+        SGLANG_JIT_CACHE_DIR=str(cache / '.cache/sglang/jit'),
+        SGLANG_DG_CACHE_DIR=str(cache / '.cache/sglang/deep_gemm'),
+        DG_JIT_CACHE_DIR=str(cache / '.cache/sglang/deep_gemm'),
+        FLASHINFER_WORKSPACE_BASE=str(cache), TRITON_CACHE_DIR=str(cache / '.triton/cache'),
+        TORCHINDUCTOR_CACHE_DIR=str(cache / '.inductor'), CUDA_CACHE_PATH=str(cache / '.nv/ComputeCache'),
+        CC='/usr/bin/gcc-12', CXX='/usr/bin/g++-12',
+        # The wheel bundles the Rust extensions; workers have no Cargo (as in the k31 image).
+        SGLANG_RUST_BUILD_MODE='never',
+        # InferenceX fix for the TP16 CUDA-graph crash in the sharded MoE front (N=1048 slice GEMM).
+        SGLANG_K3_SHARDED_MOE='0',
+        NCCL_MNNVL_ENABLE='1', NCCL_CUMEM_ENABLE='1',
+        GLOO_SOCKET_IFNAME='bond0', NCCL_SOCKET_IFNAME='bond0',
+    )
+    env.update({key: str(value) for key, value in cfg.get('extra_env', {}).items()})
+    for key in ['TMPDIR', 'XDG_CACHE_HOME', 'SGLANG_CACHE_DIR', 'SGLANG_JIT_CACHE_DIR',
+                'SGLANG_DG_CACHE_DIR', 'TRITON_CACHE_DIR', 'TORCHINDUCTOR_CACHE_DIR', 'CUDA_CACHE_PATH']:
+        Path(env[key]).mkdir(parents=True, exist_ok=True)
+    return env
+
+
+def engine_args(cfg, rank):
+    args = ['--model-path', cfg['model_path'], '--served-model-name', cfg['served_model_name'],
+            '--trust-remote-code', '--tp-size', cfg['tp_size'], '--dcp-size', cfg['dcp_size'],
+            '--nnodes', len(cfg['nodes']), '--node-rank', rank,
+            '--dist-init-addr', f'{head(cfg)["host"]}:{cfg["dist_init_port"]}',
+            '--kv-cache-dtype', cfg['kv_cache_dtype'], '--mamba-ssm-dtype', cfg['mamba_ssm_dtype'],
+            '--mem-fraction-static', cfg['mem_fraction_static'], '--context-length', cfg['context_length'],
+            '--max-running-requests', cfg['max_running_requests'],
+            '--reasoning-parser', 'kimi_k3', '--tool-call-parser', 'kimi_k3',
+            '--watchdog-timeout', cfg['watchdog_timeout'], '--disable-flashinfer-autotune',
+            '--model-loader-extra-config', json.dumps({'enable_multithread_load': True}),
+            '--host', cfg['bind_host'], '--port', cfg['port'], '--enable-metrics']
+    if rank == 0:
+        # Native authentication; the key stays out of argv.
+        args += ['--config', AUTH_CONFIG]
+    if not cfg['radix_cache']:
+        args.append('--disable-radix-cache')
+    spec = cfg.get('speculative')
+    if spec:
+        args += ['--speculative-algorithm', 'DFLASH', '--speculative-draft-model-path', spec['draft_model_path'],
+                 '--speculative-draft-attention-backend', 'cutedsl_mla',
+                 '--speculative-draft-kv-cache-dtype', cfg['kv_cache_dtype'],
+                 '--speculative-num-draft-tokens', spec['num_draft_tokens'],
+                 '--speculative-use-block-verification', '--enable-linear-replayssm-spec']
+    args += cfg.get('extra_args', [])
+    return [str(value) for value in args]
+
+
+def serve(cfg, rank):
+    if os.getpgrp() != os.getpid():
+        os.setpgrp()
+    env = launch_environment(cfg)
+    command = [str(VENV / 'bin/python'), str(ROOT / 'kimictl'), '_engine', *engine_args(cfg, rank)]
+    state = dict(proc_info(os.getpid()), rank=rank, command=command, config=cfg,
+                 started_at=time.time(), log=str(LOG))
+    temporary = STATE.with_suffix('.tmp')
+    temporary.write_text(json.dumps(state, indent=2) + '\n')
+    temporary.replace(STATE)
+    print('LAUNCH ' + json.dumps(command), flush=True)
+    os.execve(command[0], command, env)
+
+
+def engine():
+    # What `sglang serve` does for an LLM, behind this file's log redaction.
+    from sglang.launch_server import run_server
+    from sglang.srt.plugins import load_plugins
+    from sglang.srt.server_args import prepare_server_args
+    from sglang.srt.utils import kill_process_tree
+    load_plugins()
+    server_args = prepare_server_args(sys.argv[2:])
+    try:
+        run_server(server_args)
+    finally:
+        kill_process_tree(os.getpid(), include_parent=False)
+
+
+def node_start(cfg, rank):
+    os.umask(0o077)
+    with locked('node'):
+        state = tracked_state()
+        if session_exists(cfg) or state_is_alive(state):
+            raise RuntimeError('this node already runs an owned engine; stop it first')
+        if state and group_members(state['pgid']):
+            raise RuntimeError('owned child processes remain; run stop before starting')
+        report = node_preflight(cfg, rank)
+        if report['problems']:
+            raise RuntimeError('preflight failed: ' + '; '.join(report['problems']))
+        (ROOT / 'logs').mkdir(exist_ok=True)
+        if LOG.exists():
+            stamp = datetime.datetime.now().strftime('%Y%m%d-%H%M%S-%f')
+            LOG.rename(ROOT / 'logs' / f'sglang-{stamp}.log')
+        command = 'exec ' + shlex.join([sys.executable, str(ROOT / 'kimictl'), '_serve', '--rank', str(rank)])
+        command += ' > ' + shlex.quote(str(LOG)) + ' 2>&1'
+        tmux('new-session', '-d', '-s', session_name(cfg), '-c', ROOT, command)
+
+
+def node_stop(cfg):
+    with locked('node'):
+        state = tracked_state()
+        if state:
+            info = proc_info(state['pid'])
+            if info and info['start_ticks'] != state['start_ticks']:
+                raise RuntimeError('tracked PID was reused; refusing to signal it')
+            for sig, grace in ((signal.SIGTERM, 60), (signal.SIGKILL, 20)):
+                if not group_members(state['pgid']):
+                    break
+                os.killpg(state['pgid'], sig)
+                deadline = time.monotonic() + grace
+                while group_members(state['pgid']) and time.monotonic() < deadline:
+                    time.sleep(0.5)
+            if group_members(state['pgid']):
+                raise RuntimeError('owned processes remain after SIGKILL; inspect driver/process state')
+        if session_exists(cfg):
+            tmux('kill-session', '-t', session_name(cfg))
+
+
+def node_status(cfg):
+    state = tracked_state()
+    gpus, apps = gpu_report()
+    alive = state_is_alive(state)
+    return {'tmux': session_exists(cfg), 'engine': alive, 'pid': state['pid'] if alive else None,
+            'uptime_s': int(time.time() - state['started_at']) if alive else None,
+            'gpu_memory_used_mib': [gpu['memory_used_mib'] for gpu in gpus],
+            'recovery_actions': sorted({gpu['recovery_action'] for gpu in gpus}), 'compute_apps': len(apps)}
+
+
+# ----- cluster actions (run on c04) -----
+
+def on_node(node, *args, timeout=120):
+    """Run a kimictl subcommand on a node; locally when that node is this one."""
+    command = ['/usr/bin/python3', str(ROOT / 'kimictl'), *map(str, args)]
+    if node['hostname'] != socket.gethostname().split('.')[0]:
+        command = [*SSH, node['host'], shlex.join(command)]
+    return subprocess.run(command, text=True, capture_output=True, timeout=timeout)
+
+
+def on_all(cfg, *args, timeout=120):
+    with concurrent.futures.ThreadPoolExecutor(len(cfg['nodes'])) as pool:
+        return list(pool.map(lambda node: on_node(node, *args, timeout=timeout), cfg['nodes']))
+
+
+def node_json(node, result):
+    if result.returncode:
+        raise RuntimeError(f'{node["name"]}: ' + (result.stderr.strip().splitlines() or ['failed'])[-1])
+    return json.loads(result.stdout)
+
+
+def require_head(cfg):
+    if this_rank(cfg) != 0:
+        raise RuntimeError(f'run cluster commands on {head(cfg)["name"]}')
+
+
+def auth_headers():
+    return {'Authorization': 'Bearer ' + API_KEY.read_text().strip()} if API_KEY.exists() else {}
+
+
+def request(cfg, path, timeout=5):
+    req = urllib.request.Request(f'http://{head(cfg)["host"]}:{cfg["port"]}{path}', headers=auth_headers())
+    with OPENER.open(req, timeout=timeout) as response:
+        return response.read()
+
+
+def healthy(cfg):
+    try:
+        request(cfg, '/health', timeout=3)
+        return True
+    except (OSError, urllib.error.URLError):
+        return False
+
+
+def init_key():
+    if API_KEY.exists() or AUTH_CONFIG.exists():
+        raise RuntimeError(f'{PRIVATE} already holds a key; remove it deliberately to rotate')
+    PRIVATE.mkdir(mode=0o700, exist_ok=True)
+    key = 'sk-kimi-' + secrets.token_urlsafe(32)
+    for path, text in ((API_KEY, key + '\n'), (AUTH_CONFIG, f'api-key: {key}\n')):
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, 'w') as handle:
+            handle.write(text)
+    print(f'Created {API_KEY} and {AUTH_CONFIG} (mode 0600).')
+
+
+def sync(cfg):
+    """Push the runtime files (not secrets, venvs or weights) to the worker nodes."""
+    require_head(cfg)
+    files = [name for name in RUNTIME_FILES if (ROOT / name).exists()]
+    def push(node):
+        subprocess.run([*SSH, node['host'], shlex.join(['mkdir', '-p', str(ROOT)])], check=True, timeout=30)
+        subprocess.run([str(RSYNC), '-a', '-e', shlex.join(SSH), f'--rsync-path={RSYNC}',
+                        *[str(ROOT / name) for name in files], f'{node["host"]}:{ROOT}/'],
+                       check=True, timeout=120)
+    with concurrent.futures.ThreadPoolExecutor(3) as pool:
+        list(pool.map(push, cfg['nodes'][1:]))
+    print(f'Synchronized {", ".join(files)} to {", ".join(node["name"] for node in cfg["nodes"][1:])}.')
+
+
+def preflight(cfg, quiet=False):
+    require_head(cfg)
+    reports = [node_json(node, result) for node, result in zip(cfg['nodes'], on_all(cfg, '_preflight'))]
+    ok = True
+    for node, report in zip(cfg['nodes'], reports):
+        if report['digests'] != reports[0]['digests']:
+            report['problems'].append('runtime files differ from c04; run sync')
+        ok &= not report['problems']
+        if not quiet or report['problems'] or report['warnings']:
+            used = '/'.join(str(gpu['memory_used_mib']) for gpu in report['gpus'])
+            print(f'{node["name"]}: {"ok" if not report["problems"] else "BLOCKED"}; GPU MiB used {used}')
+            for line in report['problems']:
+                print(f'  problem: {line}')
+            for line in report['warnings']:
+                print(f'  warning: {line}')
+    return ok
+
+
+def stop(cfg):
+    require_head(cfg)
+    failed = False
+    for node, result in zip(cfg['nodes'], on_all(cfg, '_stop', timeout=180)):
+        if result.returncode:
+            failed = True
+            print(f'{node["name"]}: stop failed: {result.stderr.strip()}')
+    print('Stop failed on some nodes; inspect them before restarting.' if failed else
+          'Owned Kimi K3.1 engines stopped on all nodes. Logs and model files are preserved.')
+    return 1 if failed else 0
+
+
+def log_tail(node, lines=40):
+    result = on_node(node, '_logs', '-n', lines)
+    return result.stdout if result.returncode == 0 else result.stderr
+
+
+def start(cfg, no_wait):
+    require_head(cfg)
+    with locked('cluster'):
+        if healthy(cfg):
+            print(f'Already healthy: http://{head(cfg)["host"]}:{cfg["port"]}/v1')
+            return 0
+        statuses = [node_json(node, result) for node, result in zip(cfg['nodes'], on_all(cfg, '_status'))]
+        running = [node['name'] for node, status in zip(cfg['nodes'], statuses) if status['tmux'] or status['engine']]
+        if running:
+            raise RuntimeError(f'engines are starting or unhealthy on {", ".join(running)}; inspect status/logs')
+        sync(cfg)
+        if not preflight(cfg, quiet=True):
+            raise RuntimeError('preflight failed; nothing was started')
+        for rank, node in enumerate(cfg['nodes']):
+            result = on_node(node, '_start', '--rank', rank)
+            if result.returncode:
+                stop(cfg)
+                raise RuntimeError(f'{node["name"]} failed to start: {result.stderr.strip()}')
+    print(f'Started TP{cfg["tp_size"]} DCP{cfg["dcp_size"]} on {", ".join(n["name"] for n in cfg["nodes"])}. '
+          f'Logs: {LOG} on each node.', flush=True)
+    if no_wait:
+        return 0
+    started = time.monotonic()
+    deadline = started + cfg['startup_timeout_seconds']
+    report_at = 0
+    while time.monotonic() < deadline:
+        if healthy(cfg):
+            print(f'Ready after {int(time.monotonic() - started)} s: http://{head(cfg)["host"]}:{cfg["port"]}/v1; '
+                  f'model={cfg["served_model_name"]}')
+            return 0
+        if time.monotonic() >= report_at:
+            statuses = [node_json(node, result) for node, result in zip(cfg['nodes'], on_all(cfg, '_status'))]
+            dead = [node for node, status in zip(cfg['nodes'], statuses) if not status['engine']]
+            if dead:
+                # Read rank 0 first: a rank that exits often takes the others down with gloo errors.
+                print(f'Engine exited on {", ".join(node["name"] for node in dead)} during startup.')
+                for node in cfg['nodes']:
+                    print(f'--- {node["name"]} log tail ---\n{log_tail(node)}')
+                stop(cfg)
+                return 1
+            memory = ' '.join(f'{node["name"]}={max(status["gpu_memory_used_mib"]) // 1024}G'
+                              for node, status in zip(cfg['nodes'], statuses))
+            print(f'[{int(time.monotonic() - started)} s] loading weights / capturing graphs; max GPU use {memory}',
+                  flush=True)
+            report_at = time.monotonic() + 60
+        time.sleep(10)
+    print('Readiness timed out; engines were left running. Inspect status/logs before restarting.')
+    return 1
+
+
+def status(cfg):
+    require_head(cfg)
+    is_healthy = healthy(cfg)
+    print(f'API: {"healthy" if is_healthy else "not ready"} (http://{head(cfg)["host"]}:{cfg["port"]}/v1)')
+    all_up = True
+    for node, result in zip(cfg['nodes'], on_all(cfg, '_status')):
+        try:
+            state = node_json(node, result)
+        except RuntimeError as exc:
+            print(f'{node["name"]}: unreachable ({exc})')
+            all_up = False
+            continue
+        all_up &= state['engine']
+        uptime = f'up {state["uptime_s"] // 60} min, pid {state["pid"]}' if state['engine'] else 'down'
+        print(f'{node["name"]}: tmux {"up" if state["tmux"] else "down"}; engine {uptime}; '
+              f'GPU MiB {"/".join(map(str, state["gpu_memory_used_mib"]))}; '
+              f'recovery {",".join(state["recovery_actions"])}')
+    live = tracked_state()
+    if live and state_is_alive(live):
+        cfg = live['config']
+        spec = cfg.get('speculative')
+        print(f'Model: {cfg["served_model_name"]}; TP{cfg["tp_size"]} DCP{cfg["dcp_size"]}; '
+              f'context {cfg["context_length"]:,}; max running {cfg["max_running_requests"]}; '
+              f'radix cache {"on" if cfg["radix_cache"] else "off"}; '
+              f'decoding {"DFLASH x" + str(spec["num_draft_tokens"]) if spec else "plain"}')
+    return 0 if is_healthy and all_up else 1
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    sub = parser.add_subparsers(dest='action', required=True)
+    for name in ['preflight', 'sync', 'stop', 'status', 'init-key']:
+        sub.add_parser(name)
+    for name in ['start', 'restart']:
+        sub.add_parser(name).add_argument('--no-wait', action='store_true')
+    logs = sub.add_parser('logs')
+    logs.add_argument('--node', default='c04', choices=list(NODES))
+    logs.add_argument('-n', type=int, default=60)
+    logs.add_argument('-f', '--follow', action='store_true')
+    for name in ['_start', '_serve']:
+        sub.add_parser(name).add_argument('--rank', type=int, required=True)
+    for name in ['_preflight', '_stop', '_status']:
+        sub.add_parser(name)
+    sub.add_parser('_logs').add_argument('-n', type=int, default=60)
+    if len(sys.argv) > 1 and sys.argv[1] == '_engine':
+        return engine()
+    args = parser.parse_args()
+    if args.action == 'init-key':
+        return init_key()
+    cfg = config()
+    if args.action == '_preflight':
+        print(json.dumps(node_preflight(cfg, this_rank(cfg))))
+    elif args.action == '_start':
+        node_start(cfg, args.rank)
+    elif args.action == '_serve':
+        serve(cfg, args.rank)
+    elif args.action == '_stop':
+        node_stop(cfg)
+    elif args.action == '_status':
+        print(json.dumps(node_status(cfg)))
+    elif args.action == '_logs':
+        return subprocess.call(['tail', '-n', str(args.n), str(LOG)])
+    elif args.action == 'preflight':
+        return 0 if preflight(cfg) else 1
+    elif args.action == 'sync':
+        sync(cfg)
+    elif args.action == 'start':
+        return start(cfg, args.no_wait)
+    elif args.action == 'stop':
+        return stop(cfg)
+    elif args.action == 'restart':
+        stop(cfg)
+        return start(cfg, args.no_wait)
+    elif args.action == 'status':
+        return status(cfg)
+    elif args.action == 'logs':
+        require_head(cfg)
+        node = next(node for node in cfg['nodes'] if node['name'] == args.node)
+        command = ['tail', '-F' if args.follow else f'-n{args.n}', str(LOG)]
+        if node['hostname'] != socket.gethostname().split('.')[0]:
+            command = [*SSH, node['host'], shlex.join(command)]
+        return subprocess.call(command)
+    return 0
+
+
+if __name__ == '__main__':
+    try:
+        sys.exit(main())
+    except (RuntimeError, ValueError) as exc:
+        print(f'error: {exc}', file=sys.stderr)
+        sys.exit(1)

@@ -1,0 +1,27 @@
+{
+  "nodes": [
+    {"name": "c04", "host": "10.78.202.32", "hostname": "s04-p1-dgx-02-c04"},
+    {"name": "c11", "host": "10.78.202.39", "hostname": "s04-p1-dgx-02-c11"},
+    {"name": "c13", "host": "10.78.202.41", "hostname": "s04-p1-dgx-02-c13"},
+    {"name": "c14", "host": "10.78.202.42", "hostname": "s04-p1-dgx-02-c14"}
+  ],
+  "bind_host": "10.78.202.32",
+  "port": 30000,
+  "dist_init_port": 20000,
+  "model_path": "/scratch_local/user_data/yiming/models/Kimi-K3.1-Pro",
+  "served_model_name": "kimi-k3.1-pro",
+  "tp_size": 16,
+  "dcp_size": 16,
+  "context_length": 262144,
+  "max_running_requests": 64,
+  "mem_fraction_static": 0.85,
+  "kv_cache_dtype": "fp8_e4m3",
+  "mamba_ssm_dtype": "float32",
+  "radix_cache": false,
+  "speculative": null,
+  "watchdog_timeout": 3600,
+  "startup_timeout_seconds": 3600,
+  "nccl_debug": "WARN",
+  "extra_env": {},
+  "extra_args": []
+}
