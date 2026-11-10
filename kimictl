@@ -42,6 +42,9 @@ PRIVATE = ROOT / '.secrets'
 API_KEY = PRIVATE / 'api-key'
 AUTH_CONFIG = PRIVATE / 'sglang-auth.yaml'
 VERIFIED = '.kimi-verified.json'
+GPU_IDLE_MIB = 1024
+# The driver frees a process's GPU memory only after the process is reaped; how long stop waits.
+GPU_RELEASE_SECONDS = 180
 RUNTIME_FILES = ['kimictl', 'serving.json', 'verify_venv.py', 'evict_page_cache.py', 'README.md', 'DEPLOYMENT_STATUS.md', '.gitignore']
 # The only nodes this deployment may use, in rank order: name -> (bond0 IP, hostname).
 NODES = {
@@ -198,6 +201,18 @@ def gpu_report():
     return gpus, apps.splitlines() if apps else []
 
 
+def idle_problems(gpus, apps):
+    problems = []
+    for index, gpu in enumerate(gpus):
+        if gpu['memory_used_mib'] < 0:
+            problems.append(f'GPU {index} memory use is unreadable')
+        elif gpu['memory_used_mib'] > GPU_IDLE_MIB:
+            problems.append(f'GPU {index} has {gpu["memory_used_mib"]} MiB in use')
+    if apps:
+        problems.append('GPUs have compute processes: ' + '; '.join(apps))
+    return problems
+
+
 def other_users():
     me = os.getuid()
     uids = set()
@@ -285,16 +300,11 @@ def node_preflight(cfg, rank):
             problems.append(f'GPU {index} recovery action is {gpu["recovery_action"]}')
         if (gpu['fabric_state'], gpu['fabric_status'], gpu['fabric_health']) != ('Completed', 'Success', 'Healthy'):
             problems.append(f'GPU {index} fabric is {gpu["fabric_state"]}/{gpu["fabric_status"]}/{gpu["fabric_health"]}')
-        if gpu['memory_used_mib'] < 0:
-            problems.append(f'GPU {index} memory use is unreadable')
-        elif gpu['memory_used_mib'] > 1024:
-            problems.append(f'GPU {index} has {gpu["memory_used_mib"]} MiB in use')
+    problems += idle_problems(gpus, apps)
     cache = hbm_page_cache_gib()
     if cache >= 1:
         problems.append(f'{cache:.0f} GiB of page cache sits in HBM (counted as GPU memory in use); '
                         'start drops the model files\' share, other files\' cache needs their owner')
-    if apps:
-        problems.append('GPUs have compute processes: ' + '; '.join(apps))
     imex = subprocess.run(['systemctl', 'is-active', 'nvidia-imex'], text=True, capture_output=True).stdout.strip()
     if imex != 'active':
         problems.append(f'nvidia-imex is {imex or "unknown"}')
@@ -424,24 +434,54 @@ def node_start(cfg, rank):
         tmux('new-session', '-d', '-s', session_name(cfg), '-c', ROOT, command)
 
 
-def node_stop(cfg):
+def wait_for_exit(pgid, seconds):
+    deadline = time.monotonic() + seconds
+    while group_members(pgid) and time.monotonic() < deadline:
+        time.sleep(1)
+    return [item['pid'] for item in group_members(pgid)]
+
+
+def node_stop(cfg, mode, timeout):
+    """Stop this node's engine and wait for the driver to release its GPUs.
+
+    drain: SIGTERM the engine's main process only. On rank 0 SGLang finishes in-flight requests,
+        then broadcasts ShutdownReq, so every rank's schedulers free GPU state in userspace and exit.
+    await: signal nothing; a follower exits once rank 0's ShutdownReq has stopped its schedulers.
+    force: SIGTERM, then SIGKILL, the whole process group, for ranks that cannot drain (a dead peer
+        or a hang). SGLang notes that killing a scheduler mid-release is how GPU memory outlives it.
+    """
     with locked('node'):
         state = tracked_state()
+        remaining = []
         if state:
             info = proc_info(state['pid'])
             if info and info['start_ticks'] != state['start_ticks']:
                 raise RuntimeError('tracked PID was reused; refusing to signal it')
-            for sig, grace in ((signal.SIGTERM, 60), (signal.SIGKILL, 20)):
-                if not group_members(state['pgid']):
-                    break
-                os.killpg(state['pgid'], sig)
-                deadline = time.monotonic() + grace
-                while group_members(state['pgid']) and time.monotonic() < deadline:
-                    time.sleep(0.5)
-            if group_members(state['pgid']):
-                raise RuntimeError('owned processes remain after SIGKILL; inspect driver/process state')
+            main_alive = bool(info and info['state'] != 'Z')
+            pgid = state['pgid']
+            if mode == 'force':
+                for sig, grace in ((signal.SIGTERM, 30), (signal.SIGKILL, 30)):
+                    if group_members(pgid):
+                        os.killpg(pgid, sig)
+                        remaining = wait_for_exit(pgid, grace)
+            else:
+                if mode == 'drain' and main_alive:
+                    os.kill(state['pid'], signal.SIGTERM)
+                # Without a live main process nothing here will drain; report the orphans at once.
+                remaining = wait_for_exit(pgid, timeout if main_alive else 5)
+        if remaining:
+            return {'stopped': False, 'remaining': remaining}
         if session_exists(cfg):
             tmux('kill-session', '-t', session_name(cfg))
+        deadline = time.monotonic() + GPU_RELEASE_SECONDS
+        while True:
+            gpus, apps = gpu_report()
+            problems = idle_problems(gpus, apps)
+            if not problems or time.monotonic() >= deadline:
+                break
+            time.sleep(2)
+        return {'stopped': True, 'remaining': [], 'gpu_problems': problems,
+                'gpu_memory_used_mib': [gpu['memory_used_mib'] for gpu in gpus]}
 
 
 def node_status(cfg):
@@ -492,7 +532,8 @@ def request(cfg, path, timeout=5):
 
 def healthy(cfg):
     try:
-        request(cfg, '/health', timeout=3)
+        # /health runs a one-token generation; it takes about 1 s idle and longer under load.
+        request(cfg, '/health', timeout=20)
         return True
     except (OSError, urllib.error.URLError):
         return False
@@ -542,16 +583,48 @@ def preflight(cfg, quiet=False):
     return ok
 
 
-def stop(cfg):
+def node_stops(nodes, mode, timeout):
+    def one(node):
+        try:
+            return node_json(node, on_node(node, '_stop', '--mode', mode, '--timeout', timeout,
+                                           timeout=timeout + GPU_RELEASE_SECONDS + 180))
+        except (RuntimeError, ValueError, subprocess.TimeoutExpired) as exc:
+            return {'stopped': False, 'error': str(exc)}
+    with concurrent.futures.ThreadPoolExecutor(max(len(nodes), 1)) as pool:
+        return dict(zip([node['name'] for node in nodes], pool.map(one, nodes)))
+
+
+def stop(cfg, force=False, drain_timeout=600):
     require_head(cfg)
-    failed = False
-    for node, result in zip(cfg['nodes'], on_all(cfg, '_stop', timeout=180)):
-        if result.returncode:
-            failed = True
-            print(f'{node["name"]}: stop failed: {result.stderr.strip()}')
-    print('Stop failed on some nodes; inspect them before restarting.' if failed else
-          'Owned Kimi K3.1 engines stopped on all nodes. Logs and model files are preserved.')
-    return 1 if failed else 0
+    rank0, followers = cfg['nodes'][0], cfg['nodes'][1:]
+    results = node_stops([rank0], 'drain', drain_timeout)
+    # Followers exit by themselves within seconds of rank 0's ShutdownReq.
+    results |= node_stops(followers, 'await', 120 if results[rank0['name']]['stopped'] else 0)
+    stuck = [node for node in cfg['nodes'] if not results[node['name']]['stopped']]
+    if stuck and force:
+        results |= node_stops(stuck, 'force', 0)
+    clean = True
+    for node in cfg['nodes']:
+        result = results[node['name']]
+        if 'error' in result:
+            line, clean = f'stop failed: {result["error"]}', False
+        elif not result['stopped']:
+            line, clean = f'still running (pids {result["remaining"]})', False
+        elif result['gpu_problems']:
+            line, clean = 'stopped, but the GPUs are not free: ' + '; '.join(result['gpu_problems']), False
+        else:
+            line = 'stopped; GPU MiB ' + '/'.join(map(str, result['gpu_memory_used_mib']))
+        print(f'{node["name"]}: {line}')
+    if clean:
+        print('Owned Kimi K3.1 engines stopped on all nodes and their GPUs are free. '
+              'Logs and model files are preserved.')
+        return 0
+    if not force and any(not result['stopped'] for result in results.values()):
+        print('The graceful stop did not finish. Read the logs, then `kimictl stop --force` signals '
+              'the remaining processes.')
+    else:
+        print('Do not restart or reset anything; report these nodes for driver and process inspection.')
+    return 1
 
 
 def log_tail(node, lines=40):
@@ -578,7 +651,8 @@ def start(cfg, no_wait):
         for rank, node in enumerate(cfg['nodes']):
             result = on_node(node, '_start', '--rank', rank)
             if result.returncode:
-                stop(cfg)
+                # Ranks waiting for a peer that never came cannot drain.
+                stop(cfg, force=True, drain_timeout=60)
                 raise RuntimeError(f'{node["name"]} failed to start: {result.stderr.strip()}')
     print(f'Started TP{cfg["tp_size"]} DCP{cfg["dcp_size"]} on {", ".join(n["name"] for n in cfg["nodes"])}. '
           f'Logs: {LOG} on each node.', flush=True)
@@ -600,7 +674,8 @@ def start(cfg, no_wait):
                 print(f'Engine exited on {", ".join(node["name"] for node in dead)} during startup.')
                 for node in cfg['nodes']:
                     print(f'--- {node["name"]} log tail ---\n{log_tail(node)}')
-                stop(cfg)
+                # The surviving ranks are blocked on the dead one and cannot drain.
+                stop(cfg, force=True, drain_timeout=60)
                 return 1
             memory = ' '.join(f'{node["name"]}={max(status["gpu_memory_used_mib"]) // 1024}G'
                               for node, status in zip(cfg['nodes'], statuses))
@@ -643,18 +718,26 @@ def status(cfg):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest='action', required=True)
-    for name in ['preflight', 'sync', 'stop', 'status', 'init-key']:
-        sub.add_parser(name)
+    commands = {name: sub.add_parser(name)
+                for name in ['preflight', 'sync', 'start', 'stop', 'restart', 'status', 'init-key']}
+    for name in ['stop', 'restart']:
+        commands[name].add_argument('--drain-timeout', type=int, default=600,
+                                    help='seconds rank 0 may spend finishing in-flight requests')
+        commands[name].add_argument('--force', action='store_true',
+                                    help='signal processes that did not stop gracefully (a dead rank or a hang)')
     for name in ['start', 'restart']:
-        sub.add_parser(name).add_argument('--no-wait', action='store_true')
+        commands[name].add_argument('--no-wait', action='store_true')
     logs = sub.add_parser('logs')
     logs.add_argument('--node', default='c04', choices=list(NODES))
     logs.add_argument('-n', type=int, default=60)
     logs.add_argument('-f', '--follow', action='store_true')
     for name in ['_start', '_serve']:
         sub.add_parser(name).add_argument('--rank', type=int, required=True)
-    for name in ['_preflight', '_stop', '_status', '_drop-cache']:
+    for name in ['_preflight', '_status', '_drop-cache']:
         sub.add_parser(name)
+    node_stopper = sub.add_parser('_stop')
+    node_stopper.add_argument('--mode', choices=['drain', 'await', 'force'], required=True)
+    node_stopper.add_argument('--timeout', type=int, required=True)
     sub.add_parser('_logs').add_argument('-n', type=int, default=60)
     if len(sys.argv) > 1 and sys.argv[1] == '_engine':
         return engine()
@@ -669,7 +752,7 @@ def main():
     elif args.action == '_serve':
         serve(cfg, args.rank)
     elif args.action == '_stop':
-        node_stop(cfg)
+        print(json.dumps(node_stop(cfg, args.mode, args.timeout)))
     elif args.action == '_status':
         print(json.dumps(node_status(cfg)))
     elif args.action == '_drop-cache':
@@ -683,10 +766,10 @@ def main():
     elif args.action == 'start':
         return start(cfg, args.no_wait)
     elif args.action == 'stop':
-        return stop(cfg)
+        return stop(cfg, args.force, args.drain_timeout)
     elif args.action == 'restart':
-        stop(cfg)
-        return start(cfg, args.no_wait)
+        # Never start onto GPUs a failed stop left busy.
+        return stop(cfg, args.force, args.drain_timeout) or start(cfg, args.no_wait)
     elif args.action == 'status':
         return status(cfg)
     elif args.action == 'logs':
