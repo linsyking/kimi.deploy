@@ -61,7 +61,10 @@ enables stage-2 speculative decoding.
 
 ## API
 
-Use model `kimi-k3.1-pro` with `Authorization: Bearer $(cat .secrets/api-key)`. Sampling is
+Use model `kimi-k3.1-pro` with `Authorization: Bearer $(cat .secrets/api-key)`. At the
+user's request the key, URL and model name are also published, readable by every user on
+c04, in `/scratch_local/user_data/kimi-k3.1-pro-endpoint.txt`. After `init-key` and a
+restart, rewrite that file too, or it will hand out a dead key. Sampling is
 fixed by the model (temperature 1.0, top_p 0.95); don't override it. `reasoning_effort` takes
 `low`, `high` or `max` (default `max`); `minimal` maps to `low` and `xhigh` to `max`. Don't
 send `medium`: the engine branch passes it through as a K3.1 tier, but this checkpoint's
