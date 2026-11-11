@@ -9,6 +9,7 @@ protected by the key in `.secrets/api-key`. Tunable values are in `serving.json`
 - Draft (DFLASH, stage 2): RadixArk/Kimi-K3.1-Dflash2-Preview @ ea257b38a8ee755b65287bb8ccd0938b519ce26b
 - Serving: DFLASH x8, 32 running requests, radix prefix cache on (stage 3), no HiCache
 - Engine: SGLang `kimi-k3.1-day-0` @ 8b180ca9e07e, from source in a uv venv (no containers)
+- Weights: official; pqhaz's abliteration patch is ready as an overlay, not active (see Weights)
 
 Current state and measurements are in DEPLOYMENT_STATUS.md.
 
@@ -25,6 +26,8 @@ Run these on c04, in this directory:
     ./kimictl sync          # push kimictl, serving.json and docs to the workers
     ./kimictl tunnel start|stop|status   # frp publication on remote port 8313 (see below)
     ./kimictl init-key      # create the API and admin keys (or add a missing admin key)
+    ./kimictl weights       # official or abliterated, from every rank's load record
+    ./modelctl official|abliterated   # switch weights with rollback (see Weights)
     ./smoke_test.py         # functional checks: health, models, effort tiers, tools, image, 128K needle
     ./anthropic_check.py    # /v1/messages: vision, tools, streaming, effort, web search, thinking budget
     ./claude_code_check.py  # the Claude Code CLI through a recording relay: limits, WebSearch, thinking
@@ -162,3 +165,55 @@ symlinks break `trust_remote_code`), rsyncs it to the workers over bond0 in para
 and verifies every file on every node against `manifests/*.manifest.json` (HF LFS sha256 and
 git blob ids). `verify_weights.py` writes `.kimi-verified.json` into the model directory;
 `kimictl` refuses to start without it. The service runs with `HF_HUB_OFFLINE=1`.
+
+### Official or abliterated weights
+
+    ./modelctl abliterated   # restart with pqhaz's refusal-reduction patch
+    ./modelctl official      # restart with the original weights
+    ./modelctl status        # which weights all 16 ranks actually loaded (kimictl weights)
+
+The patch is pqhaz/Kimi-K3.1-Pro-abliteration-patch-20261105 @ f9c1b234cd8ab798a1d042e59de8bf7de938f344.
+It rewrites 278 BF16 tensors in 93 of the 96 shards: attention `o_proj`, the dense and shared-expert
+`down_proj`, and `routed_expert_up_proj`. Its own script makes a patched copy of the checkpoint;
+this deployment does what ds.deploy does for its Heretic weights instead. Both variants read the
+same official shards, and nothing is copied, patched on disk or removed. The only extra weight file
+is a 29.7 GB `overlay.safetensors` holding the 278 patched tensors, on every node under
+`.runs/abliteration/f9c1b234cd8ab798a1d042e59de8bf7de938f344/`. At load, every rank's
+`DefaultModelLoader.load_weights_only` swaps them in by name, before TP sharding. This is a runtime
+patch from `checkpoint_overlay.py`; the installed SGLang files are untouched. The quantized
+experts, vision, tokenizer, encoder and DFLASH draft load unchanged.
+
+Making the overlay, on c04 (each step checks the previous one):
+
+    ./checkpoint_overlay.py download                      # 278 compressed XOR deltas, 14.7 GB
+    .venvs/sglang/bin/python -I checkpoint_overlay.py build   # deltas + official shards -> overlay
+    ./checkpoint_overlay.py distribute                    # rsync to c11, c13, c14; verify on each
+
+`build` checks every step against the patch manifest:
+
+- the manifest itself, pinned by SHA-256 in `checkpoint_overlay.py`;
+- each delta file;
+- each original tensor, before the XOR;
+- each patched tensor.
+
+`verify` hashes the overlay on a node and writes `overlay.verified.json` for that exact file. `kimictl` preflight then runs a cheap check on every node:
+
+- the pinned manifest;
+- where each tensor sits in the official checkpoint;
+- the overlay header and size;
+- the verified marker.
+
+Every rank records its overlay load in `.runs/abliteration/loads/`. These steps bind their memory to Grace RAM
+(`numactl --membind`) and drop the pages they cached, so they can run beside a live server.
+
+`modelctl` checks the overlay on all four nodes before it stops anything. Only `checkpoint_overlay`
+in serving.json changes. If the start fails, or fewer than 16 ranks record a full overlay load,
+`modelctl` restores the previous serving.json and service; it never forces a stop. A failed
+overlay check inside a rank is recorded, not raised, for the same reason: a rank that raises
+during load leaves its peers to a forced stop. The model name, keys and other settings stay the
+same. `kimictl stop` also stops the tunnel, so start it again after checking the server.
+
+pqhaz reports a partial refusal reduction: 86/89 refusals before, 37/89 after. Benign completions
+(58/60) and HumanEval (30/30) were unchanged. Those figures come from vLLM on ROCm at 4K context
+and low effort, not from this SGLang build. The DFLASH draft was trained on the official model,
+so its acceptance rate may fall.

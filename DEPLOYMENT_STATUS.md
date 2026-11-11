@@ -15,6 +15,7 @@ frp on remote port 8313. Every item of the brief's validation checklist passes f
 | 2. DFLASH | serving; functional checks, stress test and bench sweeps pass |
 | 3. Prefix cache | serving with the radix cache; HiCache tried and dropped at the user's decision |
 | Anthropic extras | web search (Exa), thinking budget and a medium-effort mapping; all checks pass |
+| Abliteration overlay | pqhaz's patch built as a 278-tensor overlay, verified on all four nodes; not active |
 
 ## Pre-flight (2026-11-10 17:54 UTC)
 
@@ -429,6 +430,40 @@ Traffic seen on the previous run (12:38-20:29 PST): 141 `/v1/messages` and 13 ch
 succeeded. Three `/v1/messages` requests from one Claude Code session got HTTP 400 at 18:47: 232,161
 input tokens plus `max_tokens` 32,000 exceed the 262,144-token context.
 
+## Abliteration overlay (prepared 2026-11-11 07:45-08:00 UTC; not active)
+
+Searching Hugging Face for uncensored K3.1 Pro variants on 2026-11-11 turned up:
+
+| Repo | What it is | Size and access |
+|---|---|---|
+| pqhaz/Kimi-K3.1-Pro-abliteration-patch-20261105 | an exact XOR weight patch for the official checkpoint | 14.70 GB; not gated |
+| lyber-ai/Kimi-K3.1-Pro-UNCENSORED-MXFP4 | full requantized weights | 514 GB; gated |
+| audnai/penclaw-Kimi-K3.1-pro-unrestricted | full 8-bit weights | 644 GB; gated |
+| Blackfrost-Research/Kimi-K3.1-Pro-DERISKED | SFT with custom .bin files | 524 GB; gated |
+
+Two more repos had no weights. Only pqhaz's patch avoids a new full download.
+
+- pqhaz's patch, rev f9c1b234cd8ab798a1d042e59de8bf7de938f344, variant `trace4`:
+  - It rewrites 278 BF16 tensors in 93 of the 96 shards: 93 `o_proj`, 93 `down_proj` and 92 `routed_expert_up_proj`.
+  - It names base revision 6d0a0202. That revision's 96 safetensors and index are byte-identical to ours (d9e99b07); only `encoding_k3.py` differs. The index SHA-256 and every original tensor's SHA-256 match ours.
+  - Its `apply_exact_patch.py` copies every shard before patching, which here would mean 1.56 TB per node.
+  - We used none of its code.
+- Applied as ds.deploy does (README, Weights): one overlay file of the patched tensors, substituted by name in every rank's weight loader.
+  - `checkpoint_overlay.py download`: 278 files, 14.70 GB, kept on c04 only under `.runs/abliteration/f9c1b234…/source/`.
+  - `build` on c04 took 112 s. Every delta, original and patched tensor matched the manifest.
+  - `distribute` to c11, c13 and c14 took 45 s. `verify` hashed all 278 tensors on each node in 2 s.
+  - Disk: `overlay.safetensors` is 29,697,811,472 bytes on every node. The official shards are unchanged.
+- Spot check: the overlay tensors differ from the official ones in about 90% of entries, by 2–8% in norm (|dW|/|W| = 0.024 to 0.079 for layers 0, 1, 51 and 92). That fits a projection along a few directions.
+- All of this ran beside the live server, bound to Grace RAM: rsync on both ends, build and verify all show memory policy `bind:0-1`. HBM page cache stayed at 0–320 kB on every node; the 320 kB were already there before. The service kept serving; `kimictl status` stayed healthy.
+- Tests: 16 offline tests in `test_checkpoint_overlay.py` cover:
+  - build and verify on a synthetic checkpoint;
+  - the load hook on SGLang's real `DefaultModelLoader`, for the target, the draft and a failed check;
+  - modelctl rollback.
+- Not yet measured on this deployment:
+  - refusals, quality, and DFLASH acceptance with the overlay;
+  - load time, which should grow a little: each rank also reads the 29.7 GB overlay.
+- `./modelctl abliterated` switches. It needs a restart (about 6 minutes of downtime), and the tunnel has to be started again afterwards.
+
 ## Public access (frp)
 
 `kimictl tunnel start` at 19:55 UTC, once stage 2 passed its checks: config check (exactly the
@@ -454,6 +489,7 @@ in `/scratch_local/user_data/kimi-k3.1-pro-endpoint.txt`, mode 0644, readable by
 
 ## Next
 
+- The abliteration overlay is ready on all four nodes; switching (`./modelctl abliterated`) waits on the user.
 - `/dev/shm` on c04 holds rank 0's leftover queue files from three stopped runs (192 KB each run);
   deleting them, now or in `kimictl stop`, waits on the user.
 - HiCache is worth another look only for more than about 200 live long conversations or more than

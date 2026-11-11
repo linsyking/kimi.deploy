@@ -62,7 +62,9 @@ GPU_IDLE_MIB = 1024
 # The driver frees a process's GPU memory only after the process is reaped; how long stop waits.
 GPU_RELEASE_SECONDS = 180
 RUNTIME_FILES = ['kimictl', 'serving.json', 'verify_venv.py', 'evict_page_cache.py', 'web_search.py',
-                 'thinking_budget.py', 'README.md', 'DEPLOYMENT_STATUS.md', '.gitignore']
+                 'thinking_budget.py', 'checkpoint_overlay.py', 'modelctl', 'README.md', 'DEPLOYMENT_STATUS.md',
+                 '.gitignore']
+OVERLAY_ENV = ['KIMI_CHECKPOINT_OVERLAY', 'KIMI_CHECKPOINT_BASE', 'KIMI_CHECKPOINT_AUDIT_DIR']
 # The only nodes this deployment may use, in rank order: name -> (bond0 IP, hostname).
 NODES = {
     'c04': ('10.78.202.32', 's04-p1-dgx-02-c04'),
@@ -130,6 +132,12 @@ if os.environ.get('KIMI_MEDIUM_EFFORT'):
     from sglang.srt.entrypoints.openai import serving_chat
     serving_chat._KIMI_K31_EFFORT_TIERS['medium'] = os.environ['KIMI_MEDIUM_EFFORT']
 
+# pqhaz's abliteration: every rank's weight loader takes the 278 patched tensors from the overlay
+# (checkpoint_overlay.py); the official shards are read as they are.
+if os.environ.get('KIMI_CHECKPOINT_OVERLAY'):
+    from checkpoint_overlay import install
+    install(*(os.environ[key] for key in OVERLAY_ENV))
+
 
 def config():
     cfg = json.loads(CONFIG_PATH.read_text())
@@ -148,6 +156,8 @@ def config():
     spec = cfg.get('speculative')
     if spec is not None and spec.get('algorithm') != 'DFLASH':
         raise ValueError('speculative must be null or a DFLASH block')
+    if not isinstance(cfg.get('checkpoint_overlay', ''), str):
+        raise ValueError('checkpoint_overlay must be a path string or absent')
     return cfg
 
 
@@ -293,8 +303,9 @@ def drop_page_cache(cfg):
 
     Grace RAM (~958 GiB) is smaller than the checkpoint, so earlier reads of it leave page cache
     in HBM, which cudaMemGetInfo counts as used and SGLang would subtract from the KV pool."""
-    for root in model_dirs(cfg):
-        for path in root.rglob('*'):
+    overlay = [Path(cfg['checkpoint_overlay'])] if cfg.get('checkpoint_overlay') else []
+    for root in model_dirs(cfg) + overlay:
+        for path in [root] if root.is_file() else root.rglob('*'):
             if path.is_file():
                 fd = os.open(path, os.O_RDONLY)
                 try:
@@ -332,6 +343,12 @@ def node_preflight(cfg, rank):
     problems += [f'missing {path}' for path in required if not path.exists()]
     if rank == 0 and cfg.get('enable_web_search') and not (EXA_KEY.exists() and EXA_KEY.read_text().strip()):
         problems.append(f'web search is enabled but {EXA_KEY} is missing or empty')
+    if cfg.get('checkpoint_overlay'):
+        from checkpoint_overlay import check
+        try:
+            check(cfg['model_path'], cfg['checkpoint_overlay'])
+        except (OSError, ValueError, KeyError) as exc:
+            problems.append(f'checkpoint overlay: {exc}')
     gpus, apps = gpu_report()
     if len(gpus) != 4:
         problems.append(f'expected 4 GPUs, found {len(gpus)}')
@@ -364,7 +381,7 @@ def launch_environment(cfg):
     cache = RUNS / 'kernel-cache/sglang'
     env = {key: value for key, value in os.environ.items()
            if key not in ('HF_TOKEN', 'NCCL_DEBUG_SUBSYS', 'http_proxy', 'https_proxy', 'all_proxy',
-                          'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'PYTHONPATH', 'VIRTUAL_ENV')}
+                          'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'PYTHONPATH', 'VIRTUAL_ENV', *OVERLAY_ENV)}
     env.update(
         # Non-interactive SSH sets HOME to the NFS home; keep every default cache on scratch.
         HOME=SCRATCH_HOME, CUDA_HOME=str(cuda), CUDA_PATH=str(cuda),
@@ -396,6 +413,10 @@ def launch_environment(cfg):
         # Strict thinking needs a default ceiling; the context length is unreachable, and an
         # explicit thinking.budget_tokens overrides it per request.
         env['SGLANG_MAX_THINK_TOKENS'] = str(cfg['context_length'])
+    if cfg.get('checkpoint_overlay'):
+        # One audit directory per start: each rank records its overlay load there.
+        audit = RUNS / 'abliteration/loads' / f'{os.getpid()}-{time.time_ns()}'
+        env.update(zip(OVERLAY_ENV, [cfg['checkpoint_overlay'], cfg['model_path'], str(audit)]))
     env.update({key: str(value) for key, value in cfg.get('extra_env', {}).items()})
     for key in ['TMPDIR', 'XDG_CACHE_HOME', 'SGLANG_CACHE_DIR', 'SGLANG_JIT_CACHE_DIR',
                 'SGLANG_DG_CACHE_DIR', 'TRITON_CACHE_DIR', 'TORCHINDUCTOR_CACHE_DIR', 'CUDA_CACHE_PATH']:
@@ -444,7 +465,7 @@ def serve(cfg, rank):
     command = [str(NUMACTL), f'--membind={membind}',
                str(VENV / 'bin/python'), str(ROOT / 'kimictl'), '_engine', *engine_args(cfg, rank)]
     state = dict(proc_info(os.getpid()), rank=rank, command=command, config=cfg,
-                 started_at=time.time(), log=str(LOG))
+                 started_at=time.time(), log=str(LOG), overlay_audit=env.get('KIMI_CHECKPOINT_AUDIT_DIR'))
     temporary = STATE.with_suffix('.tmp')
     temporary.write_text(json.dumps(state, indent=2) + '\n')
     temporary.replace(STATE)
@@ -543,8 +564,14 @@ def node_status(cfg):
     state = tracked_state()
     gpus, apps = gpu_report()
     alive = state_is_alive(state)
+    loads = []
+    if alive and state.get('overlay_audit'):
+        for path in sorted(Path(state['overlay_audit']).glob('rank-*.json')):
+            record = json.loads(path.read_text())
+            loads.append({key: record.get(key) for key in
+                          ('rank', 'manifest_sha256', 'tensor_count', 'overlay', 'base')})
     return {'tmux': session_exists(cfg), 'engine': alive, 'pid': state['pid'] if alive else None,
-            'uptime_s': int(time.time() - state['started_at']) if alive else None,
+            'uptime_s': int(time.time() - state['started_at']) if alive else None, 'overlay_loads': loads,
             'gpu_memory_used_mib': [gpu['memory_used_mib'] for gpu in gpus],
             'recovery_actions': sorted({gpu['recovery_action'] for gpu in gpus}), 'compute_apps': len(apps)}
 
@@ -765,7 +792,7 @@ def status(cfg):
     require_head(cfg)
     is_healthy = healthy(cfg)
     print(f'API: {"healthy" if is_healthy else "not ready"} (http://{head(cfg)["host"]}:{cfg["port"]}/v1)')
-    all_up = True
+    all_up, states = True, []
     for node, result in zip(cfg['nodes'], on_all(cfg, '_status')):
         try:
             state = node_json(node, result)
@@ -774,6 +801,7 @@ def status(cfg):
             all_up = False
             continue
         all_up &= state['engine']
+        states.append(state)
         uptime = f'up {state["uptime_s"] // 60} min, pid {state["pid"]}' if state['engine'] else 'down'
         print(f'{node["name"]}: tmux {"up" if state["tmux"] else "down"}; engine {uptime}; '
               f'GPU MiB {"/".join(map(str, state["gpu_memory_used_mib"]))}; '
@@ -789,9 +817,41 @@ def status(cfg):
         print(f'Anthropic extras: web search {"Exa" if cfg.get("enable_web_search") else "off"}; '
               f'thinking budget {"enforced" if cfg.get("enforce_thinking_budget") else "off"}; '
               f'effort medium -> {cfg.get("medium_effort_as") or "unmapped (HTTP 500)"}')
+        print(f'Weights: {weights_summary(cfg, states)[0]}')
     print(f'Tunnel: {"running" if state_is_alive(tunnel_state()) else "stopped"} '
           f'(frp server port {TUNNEL_PORT}; kimictl tunnel status)')
     return 0 if is_healthy and all_up else 1
+
+
+def weights_summary(cfg, states):
+    """(text, ok) for the weights a running config loaded, from every rank's overlay load record."""
+    loads = [load for state in states for load in state.get('overlay_loads', [])]
+    if not cfg.get('checkpoint_overlay'):
+        return ('official', True) if not loads else (f'official, but {len(loads)} ranks report an overlay', False)
+    from checkpoint_overlay import MANIFEST_SHA256, REVISION, TENSORS
+    expected = (MANIFEST_SHA256, TENSORS, str(Path(cfg['checkpoint_overlay']).resolve()),
+                str(Path(cfg['model_path']).resolve()))
+    ranks = sorted(load['rank'] for load in loads
+                   if (load['manifest_sha256'], load['tensor_count'], load['overlay'], load['base']) == expected)
+    return (f'abliterated (pqhaz {REVISION[:12]} overlay, {TENSORS} tensors; loaded on {len(ranks)}/'
+            f'{cfg["tp_size"]} ranks)', ranks == list(range(cfg['tp_size'])))
+
+
+def weights(cfg, expect):
+    """Exit 0 only if every node's engine runs and loaded the weights its config names (modelctl)."""
+    require_head(cfg)
+    live = tracked_state()
+    states = [node_json(node, result) for node, result in zip(cfg['nodes'], on_all(cfg, '_status'))]
+    if not state_is_alive(live) or not all(state['engine'] for state in states):
+        print('Weights: unknown; the engines are not running on every node')
+        return 1
+    text, ok = weights_summary(live['config'], states)
+    print(f'Weights: {text}')
+    variant = 'abliterated' if live['config'].get('checkpoint_overlay') else 'official'
+    if expect and expect != variant:
+        print(f'expected {expect} weights')
+        ok = False
+    return 0 if ok else 1
 
 
 # ----- frp tunnel (c04 only; modelled on ds.deploy's ds41ctl) -----
@@ -933,6 +993,8 @@ def main():
                                     help='signal processes that did not stop gracefully (a dead rank or a hang)')
     for name in ['start', 'restart']:
         commands[name].add_argument('--no-wait', action='store_true')
+    sub.add_parser('weights', help='which weights the running engines loaded').add_argument(
+        '--expect', choices=['official', 'abliterated'])
     sub.add_parser('tunnel', help='publish the API through frp on remote port 8313').add_argument(
         'tunnel_action', choices=['start', 'stop', 'status'])
     logs = sub.add_parser('logs')
@@ -980,6 +1042,8 @@ def main():
         return stop(cfg, args.force, args.drain_timeout) or start(cfg, args.no_wait)
     elif args.action == 'status':
         return status(cfg)
+    elif args.action == 'weights':
+        return weights(cfg, args.expect)
     elif args.action == 'tunnel':
         require_head(cfg)
         if args.tunnel_action == 'start':

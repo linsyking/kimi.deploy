@@ -1,0 +1,151 @@
+#!/usr/bin/env python3
+"""Switch the Kimi service between official and abliterated weights, without copies (from ds.deploy).
+
+    modelctl abliterated | official | status
+
+Run on c04. Both variants read the same official 96 shards; abliterated adds pqhaz's 278-tensor
+overlay (checkpoint_overlay.py), and only `checkpoint_overlay` in serving.json changes. The
+overlay is checked on every node before anything is stopped. A start that fails, or whose 16
+ranks do not all record loading the overlay, restores the previous serving.json and service.
+kimictl stop also stops the frp tunnel: start it again with `kimictl tunnel start` after checks."""
+import argparse
+import datetime
+import fcntl
+import json
+import os
+from pathlib import Path
+import shlex
+import signal
+import socket
+import subprocess
+import sys
+
+from checkpoint_overlay import OVERLAY
+
+ROOT = Path(__file__).resolve().parent
+SSH = ['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10']
+
+
+def atomic_write(path, data):
+    temporary = path.with_name(path.name + '.tmp')
+    with temporary.open('wb') as handle:
+        handle.write(data)
+        handle.flush()
+        os.fsync(handle.fileno())
+    temporary.replace(path)
+
+
+def controller(root, *action):
+    subprocess.run([sys.executable, str(root / 'kimictl'), *action], check=True)
+
+
+def validate_loaded(root, variant):
+    controller(root, 'weights', '--expect', variant)
+
+
+def check_overlay(cfg):
+    """The overlay must be in place and verified on every node; nothing is stopped otherwise."""
+    for node in cfg['nodes']:
+        command = ['/usr/bin/python3', '-I', str(ROOT / 'checkpoint_overlay.py'), 'check']
+        if node['hostname'] != socket.gethostname().split('.')[0]:
+            command = [*SSH, node['host'], shlex.join(command)]
+        result = subprocess.run(command, text=True, capture_output=True, timeout=120)
+        if result.returncode:
+            raise ValueError(f'{node["name"]}: ' + (result.stderr.strip().splitlines() or ['check failed'])[-1])
+
+
+def switch(root, variant):
+    """Restore the exact previous config and service if the requested start fails."""
+    config_path = root / 'serving.json'
+    previous_bytes = config_path.read_bytes()
+    previous = json.loads(previous_bytes)
+    desired = dict(previous)
+    if variant == 'abliterated':
+        desired['checkpoint_overlay'] = str(OVERLAY)
+        check_overlay(desired)
+    else:
+        desired.pop('checkpoint_overlay', None)
+    state_path = root / '.runs/service.json'
+    state = json.loads(state_path.read_text()) if state_path.exists() else {}
+    if desired == previous and state.get('config') == desired:
+        try:
+            validate_loaded(root, variant)
+        except subprocess.CalledProcessError:
+            pass
+        else:
+            print(f'Already running {variant} weights.', flush=True)
+            return
+    stamp = datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%d-%H%M%S-%fZ')
+    journal = root / '.runs/model-switch' / stamp
+    journal.mkdir(parents=True)
+    (journal / 'serving.before.json').write_bytes(previous_bytes)
+    (journal / 'serving.requested.json').write_text(json.dumps(desired, indent=2) + '\n')
+    outcome = {'variant': variant, 'base_path': previous['model_path'], 'status': 'switching'}
+
+    def save():
+        atomic_write(journal / 'result.json', (json.dumps(outcome, indent=2) + '\n').encode())
+    save()
+    if config_path.read_bytes() != previous_bytes:
+        raise RuntimeError('serving.json changed during preflight; no service was stopped')
+    print(f'Switching to {variant}; the official shards stay as they are. Backup: {journal}', flush=True)
+    try:
+        controller(root, 'stop')
+        if config_path.read_bytes() != previous_bytes:
+            raise RuntimeError('serving.json changed while stopping')
+        data = previous_bytes if desired == previous else (json.dumps(desired, indent=2) + '\n').encode()
+        atomic_write(config_path, data)
+        controller(root, 'start')
+        validate_loaded(root, variant)
+    except BaseException as error:
+        outcome.update(status='rolling_back', error=f'{type(error).__name__}: {error}')
+        save()
+        print('The requested start failed; restoring the previous configuration and service.', flush=True)
+        # Finish the rollback even if a second Ctrl+C arrives.
+        old_handlers = {s: signal.signal(s, signal.SIG_IGN) for s in (signal.SIGINT, signal.SIGTERM)}
+        try:
+            # kimictl stop never forces; GPUs that do not come free stop the rollback here.
+            controller(root, 'stop')
+            atomic_write(config_path, previous_bytes)
+            controller(root, 'start')
+            validate_loaded(root, 'abliterated' if previous.get('checkpoint_overlay') else 'official')
+            outcome['status'] = 'rolled_back'
+            save()
+        except BaseException as rollback_error:
+            outcome.update(status='rollback_failed', rollback_error=str(rollback_error))
+            save()
+            raise RuntimeError(f'Rollback failed. Inspect {journal} and kimictl status before acting.') \
+                from rollback_error
+        finally:
+            for signum, handler in old_handlers.items():
+                signal.signal(signum, handler)
+        raise RuntimeError(f'Switch failed; previous service restored. Details: {journal}') from error
+    outcome['status'] = 'ready'
+    save()
+    print(f'Ready with {variant} weights. The model name, keys and other settings are unchanged; '
+          'the tunnel is stopped.', flush=True)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument('variant', choices=['official', 'abliterated', 'status'])
+    args = parser.parse_args()
+    if args.variant == 'status':
+        return subprocess.call([sys.executable, str(ROOT / 'kimictl'), 'weights'])
+    os.umask(0o077)
+    (ROOT / '.runs').mkdir(exist_ok=True)
+
+    def interrupted(signum, frame):
+        raise KeyboardInterrupt(f'Received signal {signum}')
+    signal.signal(signal.SIGTERM, interrupted)
+    with (ROOT / '.runs/model-switch.lock').open('a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        switch(ROOT, args.variant)
+    return 0
+
+
+if __name__ == '__main__':
+    try:
+        sys.exit(main())
+    except (RuntimeError, ValueError, OSError, subprocess.SubprocessError) as error:
+        print(f'ERROR: {error}', file=sys.stderr)
+        sys.exit(1)
