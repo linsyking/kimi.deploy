@@ -432,16 +432,18 @@ input tokens plus `max_tokens` 32,000 exceed the 262,144-token context.
 
 ## Abliteration overlay (prepared 2026-11-11 07:45-08:00 UTC; not active)
 
-Searching Hugging Face for uncensored K3.1 Pro variants on 2026-11-11 turned up:
+Searching Hugging Face on 2026-11-11 found these uncensored K3.1 Pro variants; the last column is each card's own
+quality report. Sizes are the HF API's per-file sizes (an earlier, truncated listing gave 514–644 GB for the gated repos).
 
-| Repo | What it is | Size and access |
-|---|---|---|
-| pqhaz/Kimi-K3.1-Pro-abliteration-patch-20261105 | an exact XOR weight patch for the official checkpoint | 14.70 GB; not gated |
-| lyber-ai/Kimi-K3.1-Pro-UNCENSORED-MXFP4 | full requantized weights | 514 GB; gated |
-| audnai/penclaw-Kimi-K3.1-pro-unrestricted | full 8-bit weights | 644 GB; gated |
-| Blackfrost-Research/Kimi-K3.1-Pro-DERISKED | SFT with custom .bin files | 524 GB; gated |
+| Repo | What it is | Size and access | Quality reported on other prompts |
+|---|---|---|---|
+| pqhaz/Kimi-K3.1-Pro-abliteration-patch-20261105 | exact XOR patch of 278 BF16 tensors; refusals 86/89 → 37/89 | 14.7 GB; not gated | small samples, raw data published:<br>• benign prompts: 58/60 answered, before and after<br>• HumanEval: 30/30 passed, before and after<br>Low effort, 4K context, vLLM on ROCm, one judge model |
+| lyber-ai/Kimi-K3.1-Pro-UNCENSORED-MXFP4 (ABLITERATED-MXFP4 is an alias) | full checkpoint; HarmBench 320/320 complied | 1,566 GB; manual approval | full MMLU, 5-shot, logit mode, no reasoning:<br>• all subjects: 90.97% → 85.66% (−5.3 pp)<br>• without moral_scenarios: −3.0 pp<br>• college physics −11.8 pp, econometrics −13.2 pp, professional law −8.7 pp<br>No reasoning-mode, coding or agent tests |
+| audnai/penclaw-Kimi-K3.1-pro-unrestricted | full checkpoint, abliteration only; 33.9% of requests on its 519-prompt refusal benchmark answered | 1,561 GB; manual approval, opts you into marketing email | none; the card only calls coherence "intact" |
+| Blackfrost-Research/Kimi-K3.1-Pro-DERISKED | refusal-direction edit plus cyber SFT | 1,628 GB listed; the card says the weights are pending and unlocked after purchase | none; the card says no evaluation claims yet |
+| routerhub/kimi-k3.1-pro-abliterated | no weights; points to a hosted service | none | none |
 
-Two more repos had no weights. Only pqhaz's patch avoids a new full download.
+Only pqhaz's patch avoids a new full 1.56 TB download. Its quality samples are too small to show a drop of a few points, so "unchanged" there is a weak claim.
 
 - pqhaz's patch, rev f9c1b234cd8ab798a1d042e59de8bf7de938f344, variant `trace4`:
   - It rewrites 278 BF16 tensors in 93 of the 96 shards: 93 `o_proj`, 93 `down_proj` and 92 `routed_expert_up_proj`.
