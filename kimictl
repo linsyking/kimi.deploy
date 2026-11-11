@@ -44,6 +44,8 @@ API_KEY = PRIVATE / 'api-key'
 # Without an admin key SGLang lets the API key call its admin endpoints (weight updates, memory
 # release, pause); with one set they take only the admin key, which is never shared.
 ADMIN_KEY = PRIVATE / 'admin-api-key'
+# Exa credential for the Anthropic web-search adapter; read on rank 0 only, never synced or logged.
+EXA_KEY = PRIVATE / 'exa-api-key'
 AUTH_CONFIG = PRIVATE / 'sglang-auth.yaml'
 # frp publishes the API on the frp server's loopback only; c02's DeepSeek tunnel owns remote 8312.
 FRPC = LOCAL_BIN / 'frpc'
@@ -59,7 +61,8 @@ VERIFIED = '.kimi-verified.json'
 GPU_IDLE_MIB = 1024
 # The driver frees a process's GPU memory only after the process is reaped; how long stop waits.
 GPU_RELEASE_SECONDS = 180
-RUNTIME_FILES = ['kimictl', 'serving.json', 'verify_venv.py', 'evict_page_cache.py', 'README.md', 'DEPLOYMENT_STATUS.md', '.gitignore']
+RUNTIME_FILES = ['kimictl', 'serving.json', 'verify_venv.py', 'evict_page_cache.py', 'web_search.py',
+                 'thinking_budget.py', 'README.md', 'DEPLOYMENT_STATUS.md', '.gitignore']
 # The only nodes this deployment may use, in rank order: name -> (bond0 IP, hostname).
 NODES = {
     'c04': ('10.78.202.32', 's04-p1-dgx-02-c04'),
@@ -74,7 +77,7 @@ OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 def redact_log_records():
     # SGLang logs server_args, api_key included. Also runs when multiprocessing imports this
     # entrypoint in scheduler processes.
-    keys = [path.read_text().strip() for path in (API_KEY, ADMIN_KEY) if path.exists()]
+    keys = [path.read_text().strip() for path in (API_KEY, ADMIN_KEY, EXA_KEY) if path.exists()]
     keys = [key for key in keys if key]
     if not keys:
         return
@@ -113,6 +116,19 @@ def redact_log_records():
 
 
 redact_log_records()
+
+# multiprocessing spawn imports this file in the scheduler processes too, so the thinking-budget
+# patch reaches the API process and every rank's schedulers on all four nodes.
+if os.environ.get('KIMI_THINKING_BUDGET') == '1':
+    from thinking_budget import install
+    install()
+
+# The branch passes a "medium" effort (OpenAI reasoning_effort, or Anthropic output_config.effort,
+# which Claude Code sends) through as a native K3.1 tier, but this checkpoint's encoder accepts only
+# low, high and max, so such requests failed with HTTP 500. Map it as SGLang maps it for K3.
+if os.environ.get('KIMI_MEDIUM_EFFORT'):
+    from sglang.srt.entrypoints.openai import serving_chat
+    serving_chat._KIMI_K31_EFFORT_TIERS['medium'] = os.environ['KIMI_MEDIUM_EFFORT']
 
 
 def config():
@@ -314,6 +330,8 @@ def node_preflight(cfg, rank):
     if rank == 0:
         required += [API_KEY, ADMIN_KEY, AUTH_CONFIG]
     problems += [f'missing {path}' for path in required if not path.exists()]
+    if rank == 0 and cfg.get('enable_web_search') and not (EXA_KEY.exists() and EXA_KEY.read_text().strip()):
+        problems.append(f'web search is enabled but {EXA_KEY} is missing or empty')
     gpus, apps = gpu_report()
     if len(gpus) != 4:
         problems.append(f'expected 4 GPUs, found {len(gpus)}')
@@ -369,6 +387,15 @@ def launch_environment(cfg):
         NCCL_MNNVL_ENABLE='1', NCCL_CUMEM_ENABLE='1',
         GLOO_SOCKET_IFNAME='bond0', NCCL_SOCKET_IFNAME='bond0',
     )
+    if cfg.get('medium_effort_as'):
+        if cfg['medium_effort_as'] not in ('low', 'high', 'max'):
+            raise ValueError('medium_effort_as must be low, high or max')
+        env['KIMI_MEDIUM_EFFORT'] = cfg['medium_effort_as']
+    if cfg.get('enforce_thinking_budget'):
+        env['KIMI_THINKING_BUDGET'] = '1'
+        # Strict thinking needs a default ceiling; the context length is unreachable, and an
+        # explicit thinking.budget_tokens overrides it per request.
+        env['SGLANG_MAX_THINK_TOKENS'] = str(cfg['context_length'])
     env.update({key: str(value) for key, value in cfg.get('extra_env', {}).items()})
     for key in ['TMPDIR', 'XDG_CACHE_HOME', 'SGLANG_CACHE_DIR', 'SGLANG_JIT_CACHE_DIR',
                 'SGLANG_DG_CACHE_DIR', 'TRITON_CACHE_DIR', 'TORCHINDUCTOR_CACHE_DIR', 'CUDA_CACHE_PATH']:
@@ -393,6 +420,9 @@ def engine_args(cfg, rank):
         args += ['--config', AUTH_CONFIG]
     if not cfg['radix_cache']:
         args.append('--disable-radix-cache')
+    if cfg.get('enforce_thinking_budget'):
+        # Every rank's scheduler applies the grammar mask, so every rank gets the flag.
+        args.append('--enable-strict-thinking')
     spec = cfg.get('speculative')
     if spec:
         args += ['--speculative-algorithm', 'DFLASH', '--speculative-draft-model-path', spec['draft_model_path'],
@@ -430,6 +460,9 @@ def engine():
     from sglang.srt.utils import kill_process_tree
     load_plugins()
     server_args = prepare_server_args(sys.argv[2:])
+    if config().get('enable_web_search') and server_args.node_rank == 0:
+        from web_search import install
+        install(api_key=API_KEY.read_text().strip(), exa_api_key=EXA_KEY.read_text().strip())
     try:
         run_server(server_args)
     finally:
@@ -753,6 +786,9 @@ def status(cfg):
               f'context {cfg["context_length"]:,}; max running {cfg["max_running_requests"]}; '
               f'radix cache {"on" if cfg["radix_cache"] else "off"}; '
               f'decoding {"DFLASH x" + str(spec["num_draft_tokens"]) if spec else "plain"}')
+        print(f'Anthropic extras: web search {"Exa" if cfg.get("enable_web_search") else "off"}; '
+              f'thinking budget {"enforced" if cfg.get("enforce_thinking_budget") else "off"}; '
+              f'effort medium -> {cfg.get("medium_effort_as") or "unmapped (HTTP 500)"}')
     print(f'Tunnel: {"running" if state_is_alive(tunnel_state()) else "stopped"} '
           f'(frp server port {TUNNEL_PORT}; kimictl tunnel status)')
     return 0 if is_healthy and all_up else 1

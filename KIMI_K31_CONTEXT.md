@@ -75,7 +75,7 @@ Serve `moonshotai/Kimi-K3.1-Pro` as one SGLang server spanning 4 GB200 trays (16
   - Also: `serving.json`, `modelctl`, `README.md`, `DEPLOYMENT_STATUS.md`.
   - Its venv runs Python 3.11 (uv) with: sglang 0.5.23 (PyPI), sglang-kernel 0.4.10, flashinfer-python 0.7.2 plus flashinfer-jit-cache 0.7.2+cu130, sgl-deep-gemm 0.2.3.post2, sgl-flash-mla 1.0.0, sgl-deep-ep 0.1.2.post1, torch 2.14.1, nvidia-nccl-cu13 2.30.7 and cuda-python 13.4.4.
   - It sets `CUDA_HOME=<site-packages>/nvidia/cu13`.
-- **`/scratch_local/user_data/yiming/reference/glm.deploy`**: a GLM-5.3 dual-node SGLang deployment. It's useful for multi-node patterns: `glm53ctl`, `sync_worker.sh`, `serve_glm53_sglang*.sh`, `AGENTS.md`, and the source patch `patches/sglang-0.5.19-http-server-middlewares.patch`.
+- **Don't use `glm.deploy`.** The user wants `ds.deploy` to be the only deployment you take patterns from. An earlier copy at `reference/glm.deploy` has been removed.
 - **`/scratch_local/user_data/yiming/reference/rack-check/check_rack.py`** (docs in `RACK_CHECK.md`): a read-only health checker covering GPUs, NVLink fabric, RAM and login history.
   - It takes a contiguous range, so for these nodes run `--start 4 --end 4`, `--start 11 --end 11` and `--start 13 --end 14`.
   - Avoid c03: each probe there leaves another hung `nvidia-smi`.
@@ -130,10 +130,10 @@ K3.1 support comes from SGLang's day-0 work, merged to `main` on Nov 4 in PR #48
    - Put node-local kernel caches (`SGLANG_JIT_CACHE_DIR`, `DG_JIT_CACHE_DIR`, `TRITON_CACHE_DIR` and so on) under `kimi.deploy/.runs`.
 4. **Check driver compatibility early.** The driver supports CUDA 13.0, so CUDA 13.x minor-version compatibility should apply. Watch for "driver version is insufficient" errors, or PTX JIT errors.
 5. **Replicate the venv.** It must exist at the same absolute path on all 4 nodes. Build it once on c04, then copy it with `tar | ssh` to the same path on the other three, together with the uv-managed Python it points to (`~/.local/share/uv/python/cpython-*`; see `pyvenv.cfg`). c14 has no uv Pythons yet.
-6. **Patches:**
-   - `glm.deploy` applies an `http_server` middleware patch.
-   - `ds.deploy`'s extras (web search, thinking budget, checkpoint overlay) are model-specific.
-   - Port any of these only if the user asks.
+6. **Extras from `ds.deploy`:**
+   - Port the Anthropic web search and the thinking budget; see "Anthropic web search and thinking budget" below.
+   - `ds.deploy`'s other extras (MTI decoding, checkpoint overlay) are DeepSeek-specific. Don't port them unless the user asks.
+   - Don't modify files inside the installed SGLang package; patch at runtime, as `ds.deploy` does.
 
 ## Staging the weights (get the user's go-ahead first)
 
@@ -254,6 +254,55 @@ Added 2026-11-10 after your first stages. The user approved publishing the Kimi 
   - the server-local URL, `http://127.0.0.1:8313/v1` on `ssh.linsyking.com`
   - the served model name, `kimi-k3.1-pro`
   - You can't test from the frp server side yourself, so report the log lines.
+
+## Anthropic web search and thinking budget (port from `ds.deploy`)
+
+Added 2026-11-10. The user wants both features from `ds.deploy`. Reference code is in `/scratch_local/user_data/yiming/reference/ds.deploy`; its `README.md` has a "Web search" section.
+
+Neither feature modifies the SGLang package. Both patch SGLang classes at runtime, and the controller loads them in the right processes.
+
+**Web search** (`web_search.py`, test in `test_web_search.py`):
+- **What it does:** a middleware on SGLang's Anthropic-compatible `/v1/messages` endpoint.
+  - When a request includes Anthropic's built-in `web_search` tool (`web_search` or `web_search_YYYYMMDD`, as Claude Code's WebSearch sends), it runs one Exa search on the last user message and gives the results to the model as evidence.
+  - It doesn't implement Anthropic's streamed server-tool events or dynamic filtering.
+  - Requests without that tool pass through unchanged.
+- **Wiring in `ds41ctl`:**
+  - `serving.json` has `"enable_web_search": true`.
+  - Lines 215–216: refuse to start without a key.
+  - Lines 279–280: pass `EXA_API_KEY` into the engine environment.
+  - Lines 341–343: in `_engine`, call `web_search.install(api_key=..., exa_api_key=...)` before the server starts. It runs `app.add_middleware(WebSearchMiddleware, ...)`.
+- **For Kimi:** do the same in `kimictl`'s `_engine`, before `run_server`, on rank 0 (the node that runs the HTTP server).
+- **Exa key:** `kimi.deploy/.secrets/exa-api-key`, mode 600 and gitignored, already in place. It's the same key `ds.deploy` uses on c02. Never print it, log it or commit it.
+- **Build compatibility:** c04's SGLang (`0.5.24.dev1106+g8b180ca9e`) serves `/v1/messages`, and has `sglang/srt/entrypoints/search/exa_client.py` with the `ExaClient`, `ExaSearchConfig`, `_search_payload` and `_post` members that `web_search.py` uses.
+  - Those are private methods, so run `test_web_search.py` against this build.
+
+**Thinking budget** (`thinking_budget.py`):
+- **What it does:** maps an Anthropic request's `thinking.budget_tokens` onto SGLang's native thinking-budget enforcement.
+  - It patches `AnthropicServing._convert_to_chat_completion_request`. The budget then travels as `custom_params.thinking_budget`, and the request is normalized to adaptive thinking so the upstream "budget is not enforced" warning doesn't fire.
+  - It patches `GrammarManager.process_req_with_grammar` so that only budgeted or otherwise constrained requests take the grammar path. Ordinary requests stay on the fast path even with `--enable-strict-thinking` on.
+  - No client-supplied logit processor is enabled.
+- **Wiring in `ds41ctl`:**
+  - `serving.json` has `"enforce_thinking_budget": true`.
+  - Lines 281–285: set `DS41_THINKING_BUDGET=1`, and set `SGLANG_MAX_THINK_TOKENS` to the context length as an unreachable default ceiling; explicit budgets override it.
+  - Lines 320–321: add `--enable-strict-thinking`.
+  - Lines 88–91: install the patch at module import whenever `DS41_THINKING_BUDGET=1`. That way it runs in the API process and in every spawned scheduler process.
+- **For Kimi:** `kimictl` is launched the same way, so mirror this with your own env variable name.
+  - **The schedulers run on all 4 nodes, so the patch must load on every rank, not only rank 0.**
+- **Build compatibility:**
+  - Both patched methods exist in c04's build.
+  - `--enable-strict-thinking` is still supported. It's defined as `enable_strict_thinking` in `sglang/srt/arg_groups/fields/serving.py`, and enforcement lives in `constrained/reasoner_grammar_backend.py`.
+- **Not yet tested:**
+  - strict thinking with the `kimi_k3` reasoning parser;
+  - together with DFLASH speculative decoding and DCP16.
+  - Test a budgeted request: reasoning should stop at about the budget, and the answer must still be produced.
+  - Test an unbudgeted request: it must not slow down.
+- **Keep `reasoning_effort` separate.** Kimi's `reasoning_effort` (`low`, `high` or `max`) is unrelated to the token budget. `ds.deploy`'s `default_reasoning_effort` accepts DeepSeek-specific integer levels; for Kimi, allow only `low`, `high` or `max`.
+
+**Tests to add,** mirroring `ds41ctl`'s Anthropic checks (around lines 429–720):
+- `/v1/messages` with vision, a tool call, a tool result, and streaming;
+- a web-search request whose answer cites the Exa evidence;
+- a request without the search tool that makes no Exa call;
+- a budgeted thinking request and an unbudgeted one.
 
 ## Validation checklist
 
