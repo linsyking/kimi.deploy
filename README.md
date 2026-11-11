@@ -9,7 +9,7 @@ protected by the key in `.secrets/api-key`. Tunable values are in `serving.json`
 - Draft (DFLASH, stage 2): RadixArk/Kimi-K3.1-Dflash2-Preview @ ea257b38a8ee755b65287bb8ccd0938b519ce26b
 - Serving: DFLASH x8, 32 running requests, radix prefix cache on (stage 3), no HiCache
 - Engine: SGLang `kimi-k3.1-day-0` @ 8b180ca9e07e, from source in a uv venv (no containers)
-- Weights: official; pqhaz's abliteration patch is ready as an overlay, not active (see Weights)
+- Weights: official shards plus pqhaz's abliteration overlay, active since 2026-11-11 (see Weights)
 
 Current state and measurements are in DEPLOYMENT_STATUS.md.
 

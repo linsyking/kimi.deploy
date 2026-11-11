@@ -15,7 +15,7 @@ frp on remote port 8313. Every item of the brief's validation checklist passes f
 | 2. DFLASH | serving; functional checks, stress test and bench sweeps pass |
 | 3. Prefix cache | serving with the radix cache; HiCache tried and dropped at the user's decision |
 | Anthropic extras | web search (Exa), thinking budget and a medium-effort mapping; all checks pass |
-| Abliteration overlay | pqhaz's patch built as a 278-tensor overlay, verified on all four nodes; not active |
+| Abliteration overlay | serving since 08:36 UTC on 2026-11-11: pqhaz's patch as a 278-tensor overlay, loaded on all 16 ranks |
 
 ## Pre-flight (2026-11-10 17:54 UTC)
 
@@ -430,7 +430,7 @@ Traffic seen on the previous run (12:38-20:29 PST): 141 `/v1/messages` and 13 ch
 succeeded. Three `/v1/messages` requests from one Claude Code session got HTTP 400 at 18:47: 232,161
 input tokens plus `max_tokens` 32,000 exceed the 262,144-token context.
 
-## Abliteration overlay (prepared 2026-11-11 07:45-08:00 UTC; not active)
+## Abliteration overlay (prepared 2026-11-11 07:45-08:00 UTC; serving since 08:36 UTC)
 
 Searching Hugging Face on 2026-11-11 found these uncensored K3.1 Pro variants; the last column is each card's own
 quality report. Sizes are the HF API's per-file sizes (an earlier, truncated listing gave 514–644 GB for the gated repos).
@@ -464,7 +464,14 @@ Only pqhaz's patch avoids a new full 1.56 TB download. Its quality samples are t
 - Not yet measured on this deployment:
   - refusals, quality, and DFLASH acceptance with the overlay;
   - load time, which should grow a little: each rank also reads the 29.7 GB overlay.
-- `./modelctl abliterated` switches. It needs a restart (about 6 minutes of downtime), and the tunnel has to be started again afterwards.
+- Switched at the user's request on 2026-11-11 with `./modelctl abliterated`, without benchmarks:
+  - The graceful stop drained 0 requests; every GPU came back to 3–8 MiB.
+  - Ready after 370 s. Weight loading took 261.6–265.0 s per c04 rank, against 262.5–264.9 s with the official weights, so the overlay adds no measurable load time. Memory use is unchanged: 132.88 GB per GPU for the target, 1.36 GB for the draft, which loaded untouched.
+  - `kimictl weights` reports 278 tensors loaded on 16/16 ranks.
+  - `smoke_test.py` passes: health, low and max effort, tool call, image, and a 128K-token needle.
+  - The node logs show only the 4 NCCL "ibverbs lib wrapper not initialized" warnings per worker that the official run also had.
+  - The tunnel reopened at 00:37:39 PST (08:37:39 UTC).
+- Not measured: refusals, quality and DFLASH acceptance with the overlay. `./modelctl official` goes back.
 
 ## Public access (frp)
 
@@ -491,7 +498,7 @@ in `/scratch_local/user_data/kimi-k3.1-pro-endpoint.txt`, mode 0644, readable by
 
 ## Next
 
-- The abliteration overlay is ready on all four nodes; switching (`./modelctl abliterated`) waits on the user.
+- The service runs the abliterated overlay; its effect on quality and on DFLASH acceptance is unmeasured (no benchmarks, at the user's request).
 - `/dev/shm` on c04 holds rank 0's leftover queue files from three stopped runs (192 KB each run);
   deleting them, now or in `kimictl stop`, waits on the user.
 - HiCache is worth another look only for more than about 200 live long conversations or more than

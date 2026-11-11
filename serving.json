@@ -1,9 +1,25 @@
 {
   "nodes": [
-    {"name": "c04", "host": "10.78.202.32", "hostname": "s04-p1-dgx-02-c04"},
-    {"name": "c11", "host": "10.78.202.39", "hostname": "s04-p1-dgx-02-c11"},
-    {"name": "c13", "host": "10.78.202.41", "hostname": "s04-p1-dgx-02-c13"},
-    {"name": "c14", "host": "10.78.202.42", "hostname": "s04-p1-dgx-02-c14"}
+    {
+      "name": "c04",
+      "host": "10.78.202.32",
+      "hostname": "s04-p1-dgx-02-c04"
+    },
+    {
+      "name": "c11",
+      "host": "10.78.202.39",
+      "hostname": "s04-p1-dgx-02-c11"
+    },
+    {
+      "name": "c13",
+      "host": "10.78.202.41",
+      "hostname": "s04-p1-dgx-02-c13"
+    },
+    {
+      "name": "c14",
+      "host": "10.78.202.42",
+      "hostname": "s04-p1-dgx-02-c14"
+    }
   ],
   "bind_host": "10.78.202.32",
   "port": 30000,
@@ -21,10 +37,18 @@
   "enable_web_search": true,
   "enforce_thinking_budget": true,
   "medium_effort_as": "high",
-  "speculative": {"algorithm": "DFLASH", "draft_model_path": "/scratch_local/user_data/yiming/models/Kimi-K3.1-Dflash2-Preview", "num_draft_tokens": 8},
+  "speculative": {
+    "algorithm": "DFLASH",
+    "draft_model_path": "/scratch_local/user_data/yiming/models/Kimi-K3.1-Dflash2-Preview",
+    "num_draft_tokens": 8
+  },
   "watchdog_timeout": 3600,
   "startup_timeout_seconds": 3600,
   "nccl_debug": "WARN",
   "extra_env": {},
-  "extra_args": ["--mamba-max-states-per-path", "1"]
+  "extra_args": [
+    "--mamba-max-states-per-path",
+    "1"
+  ],
+  "checkpoint_overlay": "/scratch_local/user_data/yiming/kimi.deploy/.runs/abliteration/f9c1b234cd8ab798a1d042e59de8bf7de938f344/overlay.safetensors"
 }
