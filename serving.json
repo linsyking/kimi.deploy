@@ -28,7 +28,7 @@
   "served_model_name": "kimi-k3.1-pro",
   "tp_size": 16,
   "dcp_size": 16,
-  "context_length": 262144,
+  "context_length": 1046528,
   "max_running_requests": 32,
   "mem_fraction_static": 0.85,
   "kv_cache_dtype": "fp8_e4m3",

@@ -68,7 +68,12 @@ append raw SGLang flags and environment variables for experiments. Setting `spec
 `{"algorithm": "DFLASH", "draft_model_path": "/scratch_local/user_data/yiming/models/Kimi-K3.1-Dflash2-Preview", "num_draft_tokens": 8}`
 enables stage-2 speculative decoding. `radix_cache: true` (stage 3) keeps prompt prefixes on the
 GPUs; with `--mamba-max-states-per-path 1` each cached conversation holds one KDA state, and
-SGLang sizes 221 state slots, which leaves 8.04M KV tokens (14.3M without the cache). HiCache, the
+SGLang sizes 221 state slots, which leaves 8.04M KV tokens (14.3M without the cache). `context_length` is
+1,046,528 (2^20 − 2,048), not the model's 1,048,576. With DCP16, the sparse-attention indexer scores
+one row of 1,024-position blocks per request, 64-token pages across 16 GPUs. The request table also
+keeps headroom past the context for the DFLASH draft tokens. SGLang's deterministic top-k
+kernel takes rows of at most 2^20 scores, so a context of 1,048,576 fails at startup
+(`deterministic top-k: rows of at most 2^20 scores`). 1,046,528 leaves room for that headroom. HiCache, the
 host-RAM tier, was tried and dropped (DEPLOYMENT_STATUS.md). Both benchmark scripts flush the
 prefix cache before measuring.
 
@@ -86,7 +91,7 @@ to `max`. The effort is a prompt instruction to the model, not a token limit. Th
 passes `medium` through as a K3.1 tier that this checkpoint's encoder (`encoding_k3.py`) rejects
 (HTTP 500), so `serving.json`'s `medium_effort_as: "high"` maps it in the API process, as SGLang
 does for K3. `max_tokens` (or `max_completion_tokens`) caps reasoning and answer together, exactly;
-a small cap can end inside the reasoning with no answer. The context limit of 262,144 tokens
+a small cap can end inside the reasoning with no answer. The context limit of 1,046,528 tokens
 includes `max_tokens`. Reasoning and tool calls use the `kimi_k3` parsers; in
 multi-turn use send back the full assistant message, including `reasoning_content` and
 `tool_calls`. Images are accepted as input.
@@ -99,7 +104,7 @@ URL, `ANTHROPIC_AUTH_TOKEN` to the API key (Bearer auth; SGLang does not read `x
 `ANTHROPIC_API_KEY`) and the model to `kimi-k3.1-pro`. Claude Code 2.1.322 sends adaptive thinking
 with `output_config.effort` (`high` by default); `CLAUDE_CODE_MAX_OUTPUT_TOKENS` becomes
 `max_tokens`, and `MAX_THINKING_TOKENS` sends no numeric budget for this model. Sessions longer
-than the 262,144-token context minus `max_tokens` get HTTP 400.
+than the 1,046,528-token context minus `max_tokens` get HTTP 400.
 
 Web search (`enable_web_search`): `web_search.py`, ported from ds.deploy, is an ASGI middleware on
 rank 0. A `/v1/messages` request that declares Anthropic's server tool (`web_search` or

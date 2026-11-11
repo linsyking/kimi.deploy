@@ -2,9 +2,9 @@
 
 Kimi K3.1 Pro, TP16 · DCP16 across c04 (rank 0), c11, c13 and c14, on
 http://10.78.202.32:30000/v1 (model `kimi-k3.1-pro`). Stage 3 (DFLASH, 8 draft tokens, radix
-prefix cache without HiCache, 262,144 context) plus the Anthropic web search and thinking budget
-ported from ds.deploy has served since 04:36 UTC on 2026-11-11 (20:36 PST) and is published through
-frp on remote port 8313. Every item of the brief's validation checklist passes for all stages.
+prefix cache without HiCache) plus the Anthropic web search and thinking budget ported from
+ds.deploy, with pqhaz's abliteration overlay and a 1,046,528-token context, has served since
+18:24 UTC on 2026-11-11 (10:24 PST) and is published through frp on remote port 8313. Every item of the brief's validation checklist passes for all stages.
 
 | Stage | State |
 |---|---|
@@ -473,6 +473,25 @@ Only pqhaz's patch avoids a new full 1.56 TB download. Its quality samples are t
   - The tunnel reopened at 00:37:39 PST (08:37:39 UTC).
 - Not measured: refusals, quality and DFLASH acceptance with the overlay. `./modelctl official` goes back.
 
+## Context raised to 1,046,528 (2026-11-11, 18:12–18:26 UTC)
+
+At the user's request, after a client reported the 262,144-token limit. The model and the DFLASH draft
+both allow 1,048,576 (`max_position_embeddings`).
+
+- **First try: 1,048,576** (restart 18:11 UTC).
+  - The graceful stop drained 0 requests. Every GPU came back free (3–8 MiB; one c04 GPU at 120 MiB, under the 1 GiB idle threshold).
+  - Weights and overlay loaded and the KV cache was allocated, at 505,408 tokens per rank.
+  - Then every rank's first forward failed in the DSA indexer's DCP top-k:
+    `topk_v2.cuh:1467: deterministic top-k: rows of at most 2^20 scores`.
+  - Cause: `dcp_global_topk` scores rows of `page_table.shape[1] × span` positions, with span = 64-token pages × DCP16 = 1,024. The request table adds headroom past the context: 4 + draft tokens, or the decode reserve + page − 1. So 1,048,576 needs more than 1,024 blocks.
+  - The ranks exited on their own. All 16 GPUs were free (1–9 MiB) with no compute processes, so `kimictl start`'s cleanup had nothing to signal.
+- **Second try: 1,046,528 = 2^20 − 2,048** (start 18:18 UTC).
+  - Ready after 351 s. 506,496 KV tokens per rank, about 8.10M in total. Abliterated overlay on 16/16 ranks.
+  - `smoke_test.py --needle-tokens 1000000` passes, including a 998,325-token needle found in 46.3 s.
+  - No errors in any node's log.
+  - Tunnel reopened at 10:26:26 PST.
+- Downtime: from about 18:11 to 18:26 UTC, including the failed start.
+
 ## Public access (frp)
 
 `kimictl tunnel start` at 19:55 UTC, once stage 2 passed its checks: config check (exactly the
@@ -502,6 +521,5 @@ in `/scratch_local/user_data/kimi-k3.1-pro-endpoint.txt`, mode 0644, readable by
 - `/dev/shm` on c04 holds rank 0's leftover queue files from three stopped runs (192 KB each run);
   deleting them, now or in `kimictl stop`, waits on the user.
 - HiCache is worth another look only for more than about 200 live long conversations or more than
-  8M cached tokens; the context can go to 1,048,576 once the service has run stably.
-- Claude Code sessions beyond about 230K tokens get HTTP 400 at the 262,144 context; raising
-  `context_length` toward the model's 1,048,576 would help them and needs a restart and re-test.
+  8M cached tokens.
+- With 8.1M KV tokens, about 8 conversations near the full 1M context fit at once.
