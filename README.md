@@ -26,6 +26,8 @@ Run these on c04, in this directory:
     ./kimictl tunnel start|stop|status   # frp publication on remote port 8313 (see below)
     ./kimictl init-key      # create the API and admin keys (or add a missing admin key)
     ./smoke_test.py         # functional checks: health, models, effort tiers, tools, image, 128K needle
+    ./anthropic_check.py    # /v1/messages: vision, tools, streaming, effort, web search, thinking budget
+    ./claude_code_check.py  # the Claude Code CLI through a recording relay: limits, WebSearch, thinking
     ./bench.sh <label>      # bench_serving 8K in / 1K out at concurrency 1, 8, 32, 64
     ./prefix_bench.py <label>  # multi-turn prefix reuse: TTFT per turn and cache counters
 
@@ -76,12 +78,44 @@ user's request the key and the endpoint URL (nothing else) are also published, r
 every user on c04, in `/scratch_local/user_data/kimi-k3.1-pro-endpoint.txt`. After `init-key` and a
 restart, rewrite that file too, or it will hand out a dead key. Sampling is
 fixed by the model (temperature 1.0, top_p 0.95); don't override it. `reasoning_effort` takes
-`low`, `high` or `max` (default `max`); `minimal` maps to `low` and `xhigh` to `max`. Don't
-send `medium`: the engine branch passes it through as a K3.1 tier, but this checkpoint's
-encoder (`encoding_k3.py`) accepts only the three above, so the request fails with HTTP 500.
-Reasoning and tool calls use the `kimi_k3` parsers; in
+`low`, `high` or `max` (default `max`); `minimal` maps to `low`, `medium` to `high` and `xhigh`
+to `max`. The effort is a prompt instruction to the model, not a token limit. The engine branch
+passes `medium` through as a K3.1 tier that this checkpoint's encoder (`encoding_k3.py`) rejects
+(HTTP 500), so `serving.json`'s `medium_effort_as: "high"` maps it in the API process, as SGLang
+does for K3. `max_tokens` (or `max_completion_tokens`) caps reasoning and answer together, exactly;
+a small cap can end inside the reasoning with no answer. The context limit of 262,144 tokens
+includes `max_tokens`. Reasoning and tool calls use the `kimi_k3` parsers; in
 multi-turn use send back the full assistant message, including `reasoning_content` and
 `tool_calls`. Images are accepted as input.
+
+## Anthropic API and Claude Code
+
+SGLang serves the Anthropic Messages API at `http://10.78.202.32:30000/v1/messages` (through frp,
+`http://127.0.0.1:8313` on the frp server). For Claude Code set `ANTHROPIC_BASE_URL` to that base
+URL, `ANTHROPIC_AUTH_TOKEN` to the API key (Bearer auth; SGLang does not read `x-api-key`, so not
+`ANTHROPIC_API_KEY`) and the model to `kimi-k3.1-pro`. Claude Code 2.1.322 sends adaptive thinking
+with `output_config.effort` (`high` by default); `CLAUDE_CODE_MAX_OUTPUT_TOKENS` becomes
+`max_tokens`, and `MAX_THINKING_TOKENS` sends no numeric budget for this model. Sessions longer
+than the 262,144-token context minus `max_tokens` get HTTP 400.
+
+Web search (`enable_web_search`): `web_search.py`, ported from ds.deploy, is an ASGI middleware on
+rank 0. A `/v1/messages` request that declares Anthropic's server tool (`web_search` or
+`web_search_YYYYMMDD`, as Claude Code's WebSearch sends) gets one Exa search (auto, 5 results) on
+the last user text or Claude Code's "for the query:" text; the excerpts are appended to that user
+turn as evidence and the server tool is removed before inference. Identical queries are cached for
+ten minutes; a failed search returns HTTP 502 rather than an unsearched answer. `allowed_domains`
+or `blocked_domains` become Exa filters (not both). No Anthropic server-tool events, citation
+blocks or multi-search loops. Requests without the server tool pass through byte for byte. The
+Exa key is `.secrets/exa-api-key` (mode 0600, the same key ds.deploy uses); rank 0 reads it at
+launch, it is not put in the environment, synced or logged.
+
+Thinking budget (`enforce_thinking_budget`): `thinking_budget.py`, ported from ds.deploy, maps an
+Anthropic `thinking.budget_tokens` (1024 or more) onto SGLang's strict-thinking grammar, which
+closes the reasoning channel when the budget is spent and lets the answer follow; OpenAI clients
+can pass `custom_params: {"thinking_budget": N}`. kimictl adds `--enable-strict-thinking` on every
+rank and loads the patch in every process (`KIMI_THINKING_BUDGET=1`). Requests without a budget
+or a structured-output constraint skip the grammar, so they keep the fast path. Effort and budget
+are independent: effort steers how much the model wants to think, the budget is a hard cap.
 
 ## Public access (frp)
 

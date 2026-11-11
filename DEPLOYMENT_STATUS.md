@@ -2,7 +2,8 @@
 
 Kimi K3.1 Pro, TP16 · DCP16 across c04 (rank 0), c11, c13 and c14, on
 http://10.78.202.32:30000/v1 (model `kimi-k3.1-pro`). Stage 3 (DFLASH, 8 draft tokens, radix
-prefix cache without HiCache, 262,144 context) has served since 20:38 UTC and is published through
+prefix cache without HiCache, 262,144 context) plus the Anthropic web search and thinking budget
+ported from ds.deploy has served since 04:36 UTC on 2026-11-11 (20:36 PST) and is published through
 frp on remote port 8313. Every item of the brief's validation checklist passes for all stages.
 
 | Stage | State |
@@ -13,6 +14,7 @@ frp on remote port 8313. Every item of the brief's validation checklist passes f
 | 1. Baseline launch | serving; functional checks, stress test and bench sweep pass |
 | 2. DFLASH | serving; functional checks, stress test and bench sweeps pass |
 | 3. Prefix cache | serving with the radix cache; HiCache tried and dropped at the user's decision |
+| Anthropic extras | web search (Exa), thinking budget and a medium-effort mapping; all checks pass |
 
 ## Pre-flight (2026-11-10 17:54 UTC)
 
@@ -355,6 +357,78 @@ rank, 8.85 GB), `hicache_attached=False`. No host pools; locked host memory stay
 The prefix-reuse gain measured in the trial came from this same device cache. No further
 benchmarks were run, at the user's request.
 
+## Anthropic extras: web search, thinking budget, effort (2026-11-10, 20:29 PST restart)
+
+The brief's new section asks for ds.deploy's Anthropic web search and thinking budget. Both are
+runtime patches; the SGLang package is unchanged.
+
+- `web_search.py` (from ds.deploy, docstrings only changed): installed by `kimictl _engine` on rank 0
+  before `run_server`. This build has `/v1/messages` and the `ExaClient` members it uses
+  (`_search_payload`, `_post`, `close`, `ExaSearchConfig(num_results, search_type,
+  include_highlights)`); `test_web_search.py` passes its 14 tests plus a new one that drives the
+  installed client without network. Exa is reachable from c04 directly (no proxy). The key is read
+  from `.secrets/exa-api-key` on rank 0 only; unlike ds41ctl it is not put in the engine
+  environment, so the workers never see it.
+- `thinking_budget.py` (from ds.deploy, marker renamed): loaded at import of `kimictl` when
+  `KIMI_THINKING_BUDGET=1`, so in the API process and every scheduler on all four nodes;
+  `--enable-strict-thinking` on every rank and `SGLANG_MAX_THINK_TOKENS=262144` as the unreachable
+  default. In this build strict thinking attaches a grammar to every unconstrained request; the
+  patch keeps requests without a budget or a structured-output constraint off it.
+  `test_thinking_budget.py` checks the adapter offline. The engine was ready for it: the
+  `kimi_k3` reasoning detector defines its strict-thinking exclusions, XGrammar already initialized
+  with this tokenizer, and DFLASH v2 applies grammar masks to its draft chain.
+- `medium_effort_as: "high"`: Anthropic `output_config.effort="medium"` (which Claude Code sends
+  when its effort is set to medium) and OpenAI `reasoning_effort="medium"` returned HTTP 500,
+  because the branch passes `medium` through as a native K3.1 tier and this checkpoint's encoder
+  accepts only low, high and max. kimictl maps it to `high` in the API process, the mapping SGLang
+  uses for K3.
+
+Launch: ready after 351 s, `Anthropic Exa search adapter enabled`, `enable_strict_thinking: True`.
+The 32 x 8K/1K stress test passed (32/32 in 24.7 s, TPOT mean 9.7 ms, worst ITL 2.4 s), and the
+functional checks pass (`.runs/smoke/20261110-203709.json`).
+
+`anthropic_check.py` (`.runs/checks/anthropic-20261110-20*.json`), all passing:
+
+| Check | Result |
+|---|---|
+| Vision, JSON and stream | "left: red, right: blue" |
+| Tool call and tool result, JSON and stream | `fixture_lookup({"key": "deployment"})`, then the returned value |
+| Effort low / medium / high / xhigh / max, both APIs | all 200 (medium was 500 before the mapping) |
+| Web search, `web_search_20250305` JSON and `web_search_20260209` stream, allowed_domains | one Exa search (the second hit the cache), answers cite github.com/sgl-project/sglang |
+| Client tool named `web_search` (not the server tool) | passed through; no Exa call |
+| Budget 16 and 128 via OpenAI `custom_params`, raw token ids | the close marker `<\|close\|>think<\|sep\|>` starts at exactly token 16 and 128; an answer follows (with 16 the model kept reasoning in the answer until `max_tokens`) |
+| Anthropic `budget_tokens` 1024 and 2048, JSON and stream, all four in one batch | reasoning re-tokenizes to exactly 1024 and 2048 tokens, then an answer, `end_turn` |
+| Budgeted tool call and result | pass |
+
+Unbudgeted decode, one stream at a time (8 requests before the restart, 16 after): mean 200 tok/s
+before and 187 after (medians 202 and 184). The difference is about 1.5 standard errors at
+temperature 1.0 with DFLASH acceptance varying per request, so it is within noise as measured;
+by construction those requests take no grammar.
+
+`max_tokens` is enforced exactly, checked before the restart (`.runs/checks/max-tokens-pre.json`):
+64-token caps stopped at 64 on OpenAI chat (`finish_reason=length`, streaming too, and
+`max_completion_tokens`) and on `/v1/messages` (`stop_reason=max_tokens`, streaming too, thinking on
+or off). Reasoning counts toward it; DFLASH never overshoots.
+
+Claude Code 2.1.322 (`claude_code_check.py`, `.runs/claude-code/20261110-204014/`): `claude -p`
+with `ANTHROPIC_BASE_URL` at a loopback relay that records only limit and tool fields, Bearer
+auth, and a fresh HOME and config directory. All four pass:
+
+- basic: one request, answer correct.
+- `CLAUDE_CODE_MAX_OUTPUT_TOKENS=256`: four requests, each `max_tokens=256`, each stopped at 256
+  with `max_tokens`; Claude Code then reports "response exceeded the 256 output token maximum".
+  Its default is `max_tokens=32000`.
+- WebSearch: the main turn calls the tool, Claude Code sends one `web_search_20250305`
+  subrequest, the adapter answers it from Exa, and the final reply is the SGLang GitHub URL.
+- `MAX_THINKING_TOKENS=2048`: Claude Code sends `thinking: {"type": "adaptive", "display":
+  "omitted"}` and `output_config.effort: "high"`, no numeric budget, as ds.deploy found for its
+  model. Budgets therefore apply to clients that send `budget_tokens` (or `custom_params`), not
+  to Claude Code.
+
+Traffic seen on the previous run (12:38-20:29 PST): 141 `/v1/messages` and 13 chat completions
+succeeded. Three `/v1/messages` requests from one Claude Code session got HTTP 400 at 18:47: 232,161
+input tokens plus `max_tokens` 32,000 exceed the 262,144-token context.
+
 ## Public access (frp)
 
 `kimictl tunnel start` at 19:55 UTC, once stage 2 passed its checks: config check (exactly the
@@ -372,6 +446,9 @@ endpoint rejects the API key. frpc logged `login to server success` and
 `[kimi-c04-30000-to-8313] start proxy success` (12:39:33 PST). No key or frp token appears in any
 log, doc, state file or commit.
 
+Closed by the 20:29 PST restart and reopened at 20:40:59 PST after the checks above:
+`login to server success`, `[kimi-c04-30000-to-8313] start proxy success`.
+
 At the user's request the API key and the endpoint URL, and nothing else (no frp details), are
 in `/scratch_local/user_data/kimi-k3.1-pro-endpoint.txt`, mode 0644, readable by every user on c04.
 
@@ -381,5 +458,5 @@ in `/scratch_local/user_data/kimi-k3.1-pro-endpoint.txt`, mode 0644, readable by
   deleting them, now or in `kimictl stop`, waits on the user.
 - HiCache is worth another look only for more than about 200 live long conversations or more than
   8M cached tokens; the context can go to 1,048,576 once the service has run stably.
-- A hard thinking budget would need `--enable-strict-thinking` (native `/generate` only) or a
-  custom logit processor, which has no Kimi preset; neither is enabled or tested.
+- Claude Code sessions beyond about 230K tokens get HTTP 400 at the 262,144 context; raising
+  `context_length` toward the model's 1,048,576 would help them and needs a restart and re-test.
