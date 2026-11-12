@@ -9,11 +9,14 @@
                          raw token ids through OpenAI chat custom_params, mixed budgets in one batch,
                          and a budgeted tool call round trip
   speed                  decode rate of unbudgeted streamed requests (compare before and after a change)
+  documents              a two-page PDF (text page, image-only page) as an attachment (JSON) and inside a
+                         Read tool result (streamed); check_documents.py is the full regression
 
-Requests carry no sampling overrides. `budget` loads the tokenizer, so run it with the venv's Python.
+Requests carry no sampling overrides, except `documents` (temperature 0, as check_documents.py). `budget`
+loads the tokenizer and `documents` needs Pillow, so run those with the venv's Python.
 Results go to .runs/checks/anthropic-<time>.json.
 
-    anthropic_check.py [--only vision tool stream effort search no-search budget speed]"""
+    anthropic_check.py [--only vision tool stream effort search no-search budget speed documents]"""
 import argparse
 import base64
 import concurrent.futures
@@ -31,7 +34,7 @@ from smoke_test import png
 
 ROOT = Path(__file__).resolve().parent
 OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-CHECKS = ['vision', 'tool', 'stream', 'effort', 'search', 'no-search', 'budget', 'speed']
+CHECKS = ['vision', 'tool', 'stream', 'effort', 'search', 'no-search', 'budget', 'speed', 'documents']
 LOW = {'output_config': {'effort': 'low'}}
 TOOLS = [{'name': 'fixture_lookup', 'description': 'Return the deployment test value for a key.',
           'input_schema': {'type': 'object', 'properties': {'key': {'type': 'string'}}, 'required': ['key']}}]
@@ -248,6 +251,18 @@ def check_speed(client, runs=8):
                          'median': round(statistics.median(rates), 1) if rates else None}
 
 
+def check_documents(client):
+    from check_documents import read_pdf
+    from test_documents import fixture_pdf
+    code, visual = 'TEXT_' + secrets.token_hex(3), 'VISUAL_' + secrets.token_hex(3)
+    pdf, detail, ok = fixture_pdf(code, visual), {}, True
+    for name, nested, stream in (('attachment_json', False, False), ('tool_result_stream', True, True)):
+        passed, response = read_pdf(client, pdf, code, visual, nested, stream)
+        ok &= passed
+        detail[name] = dict(brief(response), passed=passed)
+    return ok, detail
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--only', nargs='+', choices=CHECKS, default=CHECKS)
@@ -255,7 +270,8 @@ def main():
     client = Client()
     runs = {'vision': check_vision, 'tool': check_tool, 'stream': check_stream, 'effort': check_effort,
             'search': check_search,
-            'no-search': check_no_search, 'budget': check_budget, 'speed': check_speed}
+            'no-search': check_no_search, 'budget': check_budget, 'speed': check_speed,
+            'documents': check_documents}
     results = {}
     for name in args.only:
         try:

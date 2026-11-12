@@ -2,7 +2,7 @@
 """Drive the Claude Code CLI against the running endpoint, run on c04 (stdlib only).
 
 A loopback relay between claude and the server records, per request, only the fields that
-decide limits and tools (max_tokens, thinking, output_config, tool types, stream, auth scheme)
+decide limits and tools (max_tokens, thinking, output_config, tool types, document count, stream, auth scheme)
 and each response's status, stop reason and usage. Prompts, model output and keys are not stored,
 except a flag for whether a reply contained a URL. claude runs with HOME and CLAUDE_CONFIG_DIR in
 a fresh directory under .runs/claude-code, so the user's settings, hooks, plugins and history are
@@ -12,8 +12,10 @@ neither used nor changed.
   max-tokens   CLAUDE_CODE_MAX_OUTPUT_TOKENS=256 on a long answer: requests carry 256, responses stop there
   search       Claude Code's WebSearch tool: its server-tool subrequest comes back with Exa source URLs
   thinking     MAX_THINKING_TOKENS=2048: records what Claude Code sends for thinking with this model
+  pdf          the Read tool on a two-page PDF (a text code; an image-only code and a bar chart): Claude Code
+               sends it as a document block and the answer has both codes (fixture: run with the venv's Python)
 
-    claude_code_check.py [--only basic max-tokens search thinking]"""
+    claude_code_check.py [--only basic max-tokens search thinking pdf]"""
 import argparse
 import datetime
 import http.server
@@ -21,6 +23,7 @@ import json
 import os
 from pathlib import Path
 import re
+import secrets
 import subprocess
 import sys
 import threading
@@ -30,9 +33,18 @@ import urllib.request
 ROOT = Path(__file__).resolve().parent
 CLAUDE = Path('/scratch_local/user_data/yiming/.local/bin/claude')
 OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-CHECKS = ['basic', 'max-tokens', 'search', 'thinking']
+CHECKS = ['basic', 'max-tokens', 'search', 'thinking', 'pdf']
 SERVER_TOOL = re.compile(r'^web_search_\d{8}$')
 HOP_HEADERS = {'host', 'content-length', 'accept-encoding', 'connection', 'transfer-encoding', 'keep-alive'}
+
+
+def document_blocks(value):
+    """How many Anthropic document blocks a message list holds, inside tool results too."""
+    if isinstance(value, list):
+        return sum(document_blocks(item) for item in value)
+    if isinstance(value, dict):
+        return (value.get('type') == 'document') + document_blocks(value.get('content'))
+    return 0
 
 
 def request_fields(path, headers, raw):
@@ -45,6 +57,7 @@ def request_fields(path, headers, raw):
             'stream': body.get('stream'), 'thinking': body.get('thinking'),
             'output_config': body.get('output_config'),
             'tools': [tool.get('type') or 'custom' for tool in body.get('tools') or [] if isinstance(tool, dict)],
+            'documents': document_blocks(body.get('messages')),
             'auth': 'bearer' if auth.startswith('Bearer ') else ('x-api-key' if 'x-api-key' in headers else None)}
 
 
@@ -191,6 +204,20 @@ def main():
                 and 'github.com' in run['result'].lower())
             run['summary'] = {'search_subrequests': len(searches),
                               'tool_types': sorted({t for c in searches for t in c['request']['tools']})}
+        elif name == 'pdf':
+            from test_documents import fixture_pdf
+            code, visual = 'TEXT_' + secrets.token_hex(3), 'VISUAL_' + secrets.token_hex(3)
+            (workdir / 'cwd').mkdir(parents=True, exist_ok=True)
+            (workdir / 'cwd/report.pdf').write_bytes(fixture_pdf(code, visual))
+            run = run_claude(workdir, relay, model, key,
+                             'Use the Read tool to read report.pdf, both pages. Reply with the code on page 1, '
+                             'the code on page 2, and which bar in the chart is taller.', ['Read'])
+            calls = messages_calls(run)
+            reads = [c for c in calls if c['request']['documents']]
+            ok = (run['exit_code'] == 0 and bool(reads) and all(c['response']['status'] == 200 for c in calls)
+                  and code in run['result'] and visual in run['result'] and 'red' in run['result'].lower())
+            run['summary'] = {'requests_with_documents': len(reads), 'statuses': [c['response']['status'] for c in calls],
+                              'result': run['result'][:200]}
         else:
             run = run_claude(workdir, relay, model, key, 'How many positive divisors does 360 have? Reply with the number.',
                              [], {'MAX_THINKING_TOKENS': '2048'})

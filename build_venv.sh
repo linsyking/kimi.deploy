@@ -115,5 +115,8 @@ cat > "$VENV/kimi-build.json" <<EOF
  "built_on": "$(hostname -s)", "built_at": "$(date -u +%FT%TZ)"}
 EOF
 
+step "Document adapter: PDFium for documents.py (requirements-documents.txt)"
+pip_install -r "$ROOT/requirements-documents.txt"
+
 step "Verify"
 KIMI_VENV=$VENV "$PY" -I "$ROOT/verify_venv.py"

@@ -31,7 +31,7 @@ Run these on c04, in this directory:
     ./kimictl weights       # official or abliterated, from every rank's load record
     ./modelctl official|abliterated   # switch weights with rollback (see Weights)
     ./smoke_test.py         # functional checks: health, models, effort tiers, tools, image, 128K needle
-    ./anthropic_check.py    # /v1/messages: vision, tools, streaming, effort, web search, thinking budget
+    ./anthropic_check.py    # /v1/messages: vision, tools, streaming, effort, web search, budget, PDF documents
     ./claude_code_check.py  # the Claude Code CLI through a recording relay: limits, WebSearch, thinking
     ./bench.sh <label>      # bench_serving 8K in / 1K out at concurrency 1, 8, 32, 64
     ./prefix_bench.py <label>  # multi-turn prefix reuse: TTFT per turn and cache counters
@@ -139,6 +139,65 @@ can pass `custom_params: {"thinking_budget": N}`. kimictl adds `--enable-strict-
 rank and loads the patch in every process (`KIMI_THINKING_BUDGET=1`). Requests without a budget
 or a structured-output constraint skip the grammar, so they keep the fast path. Effort and budget
 are independent: effort steers how much the model wants to think, the budget is a hard cap.
+
+## PDF and text documents
+
+`enable_documents` (serving.json) loads `documents.py`, ported unchanged from ds.deploy, as an ASGI
+middleware on rank 0. It handles Anthropic `document` blocks on `/v1/messages` and
+`/v1/messages/count_tokens`, both as user attachments and inside `tool_result.content`, which is how
+Claude Code's Read tool sends a PDF. This SGLang build rejects `document` blocks itself, so the
+expansion happens before its request validation:
+- Each PDF page becomes a text block, with the page's extracted text, its page number and the
+  document's title and context, followed by an image block of the same page.
+- SGLang's own image path and the MoonViT encoder read the image, so image-only and scanned pages
+  still work. This follows Anthropic's
+  [text plus page image design](https://platform.claude.com/docs/en/build-with-claude/pdf-support).
+
+Supported sources are base64 `application/pdf`, HTTP(S) PDF URLs, base64 UTF-8 `text/plain`, and
+`source: {"type": "text", "data": ...}`. Not supported:
+- Files API `file_id` references.
+- Citation events: a request that enables citations gets a clear 400.
+- Invalid or encrypted PDFs: they get a 400, not empty text.
+
+Response and SSE formats are unchanged, and no client change is needed. Set `enable_documents: false`
+and restart to turn it off.
+
+Rendering and limits:
+- PDFium (`pypdfium2`) renders at 144 DPI, capped at 2048 px per edge and 4 MP per page, JPEG quality 92.
+  A letter page becomes a 1224×1584 image.
+- Requests are limited to 128 MiB of JSON, 96 MiB of decoded documents and 256 MiB of expanded JSON.
+- A request may hold 600 PDF pages, since the context is at least 1M (100 below that). Pages are
+  never silently dropped, but the context limit still applies and 600 pages need not fit. Tokens per
+  page are in DEPLOYMENT_STATUS.md, "PDF and text documents". A page with more than 200,000
+  characters of text must be split.
+- Rendering runs off the event loop, with serialized PDFium access and at most two workers. A 128 MiB,
+  ten-minute cache keyed by the PDF bytes avoids re-rendering documents repeated in conversation
+  history.
+- The adapter checks the bearer key before touching a document, and never logs or stores PDF content.
+  URL downloads are bounded in size and time.
+
+kimictl installs it before `web_search.py`. Starlette puts the last-added middleware outermost, so web
+search sees the original user text and page text never becomes an Exa query. Keep that order.
+`count_tokens` keeps SGLang's estimate, which undercounts images; the `usage.input_tokens` of a
+generation is exact.
+
+The dependency is in `requirements-documents.txt`. `build_venv.sh` installs it, `verify_venv.py` checks
+it, and a venv built earlier gets it with:
+
+    /scratch_local/user_data/yiming/.local/bin/uv pip install --link-mode copy --python .venvs/<venv>/bin/python -r requirements-documents.txt
+    KIMI_VENV=$PWD/.venvs/<venv> ./replicate_venv.sh
+
+Tests:
+
+    CUDA_VISIBLE_DEVICES='' .venvs/<venv>/bin/python -m unittest test_documents.py test_web_search.py
+    CUDA_VISIBLE_DEVICES='' .venvs/<venv>/bin/python -m unittest test_documents_native.py  # installed SGLang
+    .venvs/<venv>/bin/python check_documents.py      # live: JSON, SSE, Read results, errors, search, page cost
+    .venvs/<venv>/bin/python anthropic_check.py --only documents
+    .venvs/<venv>/bin/python claude_code_check.py --only pdf
+
+The native test runs the installed SGLang's validator and converter on both placements, without a
+model. The live check uses a generated two-page PDF: a text code on page 1, and on page 2 an
+image-only code and a bar chart. It saves evidence under `audit/documents-*`.
 
 ## Public access (frp)
 

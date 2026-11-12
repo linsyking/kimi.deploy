@@ -4,8 +4,9 @@ Kimi K3.1 Pro, TP16 · DCP16 across c04 (rank 0), c11, c13 and c14, on
 http://10.78.202.32:30000/v1 (model `kimi-k3.1-pro`). Stage 3 (DFLASH, 8 draft tokens, radix
 prefix cache without HiCache) plus the Anthropic web search and thinking budget ported from
 ds.deploy, with the official weights and a 1,046,528-token context. It runs SGLang 7422c70f with the
-model's sampling defaults (temperature 1.0, top_p 0.95). The current server has run since 04:19 UTC
-on 2026-11-12 (20:19 PST on 11-11), and is published through frp on remote port 8313. Every item of
+model's sampling defaults (temperature 1.0, top_p 0.95), plus Anthropic PDF and text documents. The
+current server has run since 17:08 UTC on 2026-11-12 (09:08 PST), and is published through frp on
+remote port 8313. Every item of
 the brief's validation checklist passes for all stages. pqhaz's abliteration overlay served from
 2026-11-11 08:36 UTC until it was found to corrupt long structured output in Claude Code ("Claude
 Code mess" below); `./modelctl abliterated` brings it back.
@@ -22,6 +23,7 @@ Code mess" below); `./modelctl abliterated` brings it back.
 | Abliteration overlay | served 2026-11-11 08:36 UTC to 2026-11-12 04:13 UTC: pqhaz's patch as a 278-tensor overlay; official weights since |
 | Engine upgrade | 7422c70f (branch head) serving since 2026-11-12; 8b180ca9 kept for rollback |
 | Claude Code mess | reproduced; caused by the abliteration overlay, measured against the official weights |
+| PDF and text documents | ported from ds.deploy `bed126d`; serving since 2026-11-12 17:08 UTC; all checks pass |
 
 ## Pre-flight (2026-11-10 17:54 UTC)
 
@@ -647,6 +649,72 @@ as above), with no errors in any node's log.
 - Decode runs at 181 tok/s median. No node logs an error.
 - The tunnel reopened at 04:23:31 UTC (20:23:31 PST), so public access was down for 10 minutes.
 
+## PDF and text documents (2026-11-12, 16:50–17:12 UTC)
+
+Ported from ds.deploy at `bed126d` ("feat: support Anthropic PDF and text documents"), as the brief's
+new section asks. README "PDF and text documents" describes the feature.
+
+What changed:
+- `documents.py`, `test_documents.py` and `test_documents_native.py` are copied unchanged; their SHA-256s
+  match the reference.
+- `requirements-documents.txt` pins `pypdfium2==5.15.2`; only its comment changed.
+- `check_documents.py` is adapted:
+  - it uses kimictl's `config()`, `auth_headers()` and `OPENER`, and `anthropic_check.Client` in place
+    of ds41ctl's `api_json` and `api_stream`, which kimictl lacks;
+  - it adds three cases: citations, search with a PDF attached, and the page cost.
+- kimictl:
+  - adds `documents.py` and `requirements-documents.txt` to the runtime files;
+  - validates `enable_documents` as a bool;
+  - adds a rank-0 preflight that the engine's Python imports `pypdfium2`, `PIL` and `httpx`;
+  - installs the middleware on rank 0, before web search, so search stays outermost;
+  - prints the setting in `status`.
+- serving.json has `"enable_documents": true`. `anthropic_check.py` gains a `documents` check and
+  `claude_code_check.py` a `pdf` check. `/audit` is gitignored, as in ds.deploy.
+- The dependency:
+  - `pypdfium2 5.15.2` (PDFium 159.0.8149.0) went into both venvs on c04 with `uv pip install --link-mode
+    copy`. A dry run first showed it adds this one package and changes nothing else.
+  - A dry-run rsync to c11, c13 and c14 showed only the new package plus c04's bytecode caches: no
+    deletions and no other file changes. `replicate_venv.sh` then copied both venvs beside the live
+    engines, and `verify_venv.py`, which now checks the pin, passed on all three workers.
+  - `build_venv.sh` installs it in future builds.
+
+Tests:
+- Unit: `test_documents.py` and `test_web_search.py` pass (38 tests) in both venvs, CPU only. This
+  includes the search-wraps-documents order with the real classes.
+- Native: `test_documents_native.py` passes on 7422c70f and 8b180ca9. The installed validator rejects
+  `document` ("Input tag 'document'"); after expansion, both placements validate and convert to two
+  `image_url` parts, and the tool-result envelope is kept.
+- Live, after the restart (official weights):
+  - `check_documents.py` passes all 8 cases:
+    - attachment and Read `tool_result`, each as JSON and SSE. Each answer has page 1's text code, page
+      2's image-only code and the taller (red) bar.
+    - `count_tokens`;
+    - an invalid PDF and a citations request, each a 400 `invalid_request_error`;
+    - web search with the PDF attached, which cites SGLang's docs and leaves out the page code.
+  - Evidence: `audit/documents-20261112-090938/`, plus the page cost in `audit/documents-20261112-090840/`.
+    In that earlier run the search case was judged by the model echoing the query, which the evidence
+    block's own instruction overrides; it now checks the sources.
+  - `claude_code_check.py --only basic pdf` passes. Claude Code 2.1.322's Read tool sent the PDF as a
+    document block (1 request of 5), and the answer has both codes and the red bar.
+  - `smoke_test.py` passes. `anthropic_check.py` passes vision, tool, stream, effort, search, no-search,
+    speed (176 tok/s median) and documents. Budget failed once more in its known way: reasoning cut at
+    exactly 2,048, then that answer ran to max_tokens. No node logs an error.
+
+Page cost, measured with `usage.input_tokens` on 1- and 10-page letter PDFs (9 extra pages):
+
+| Page | Tokens per page | Pages in the 1,046,528-token context |
+|---|---:|---:|
+| image only (blank page, 1224×1584 image) | 2,548 | about 410 |
+| dense text (about 4,300 characters) plus its image | 3,208 | about 326 |
+
+So the image costs about 2,550 tokens, and a full page of extracted text adds about 660. The
+adapter's 600-page limit cannot be reached in practice: a request of more than about 320 text pages,
+less room for `max_tokens`, gets the server's context-length error rather than silent truncation.
+
+Restart: the stop began at about 17:02 UTC (09:02 PST) and drained 0 requests; every GPU came back to
+3–7 MiB. The server was ready after 341 s. The tunnel reopened at 17:11:51 UTC (09:11:51 PST) after the
+checks above, so public access was down for about 10 minutes.
+
 ## Public access (frp)
 
 `kimictl tunnel start` at 19:55 UTC, once stage 2 passed its checks: config check (exactly the
@@ -670,6 +738,9 @@ Closed by the 20:29 PST restart and reopened at 20:40:59 PST after the checks ab
 The diagnosis restarts on 2026-11-12 closed it twice. It was reopened at 03:00:43 UTC on the first
 7422c70f server and closed at 03:04 UTC. It was reopened again at 04:05:05 UTC (20:05:05 PST) on the
 final server: `login to server success`, `[kimi-c04-30000-to-8313] start proxy success`.
+
+The restart that enabled documents closed it at about 17:02 UTC on 2026-11-12. It reopened at 17:11:51
+UTC (09:11:51 PST): `start proxy success`.
 
 At the user's request the API key and the endpoint URL, and nothing else (no frp details), are
 in `/scratch_local/user_data/kimi-k3.1-pro-endpoint.txt`, mode 0644, readable by every user on c04.

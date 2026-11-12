@@ -64,8 +64,8 @@ GPU_IDLE_MIB = 1024
 # The driver frees a process's GPU memory only after the process is reaped; how long stop waits.
 GPU_RELEASE_SECONDS = 180
 RUNTIME_FILES = ['kimictl', 'serving.json', 'verify_venv.py', 'evict_page_cache.py', 'web_search.py',
-                 'thinking_budget.py', 'checkpoint_overlay.py', 'modelctl', 'README.md', 'DEPLOYMENT_STATUS.md',
-                 '.gitignore']
+                 'documents.py', 'requirements-documents.txt', 'thinking_budget.py', 'checkpoint_overlay.py',
+                 'modelctl', 'README.md', 'DEPLOYMENT_STATUS.md', '.gitignore']
 OVERLAY_ENV = ['KIMI_CHECKPOINT_OVERLAY', 'KIMI_CHECKPOINT_BASE', 'KIMI_CHECKPOINT_AUDIT_DIR']
 # The only nodes this deployment may use, in rank order: name -> (bond0 IP, hostname).
 NODES = {
@@ -207,6 +207,8 @@ def config():
     spec = cfg.get('speculative')
     if spec is not None and spec.get('algorithm') != 'DFLASH':
         raise ValueError('speculative must be null or a DFLASH block')
+    if not isinstance(cfg.get('enable_documents', False), bool):
+        raise ValueError('enable_documents must be true or false')
     if not isinstance(cfg.get('checkpoint_overlay', ''), str):
         raise ValueError('checkpoint_overlay must be a path string or absent')
     if not re.fullmatch(r'[A-Za-z0-9._-]+', cfg.get('venv', 'sglang')):
@@ -405,6 +407,12 @@ def node_preflight(cfg, rank):
     problems += [f'missing {path}' for path in required if not path.exists()]
     if rank == 0 and cfg.get('enable_web_search') and not (EXA_KEY.exists() and EXA_KEY.read_text().strip()):
         problems.append(f'web search is enabled but {EXA_KEY} is missing or empty')
+    if rank == 0 and cfg.get('enable_documents'):
+        probe = subprocess.run([str(venv(cfg) / 'bin/python'), '-I', '-c', 'import pypdfium2, PIL, httpx'],
+                               capture_output=True, text=True, timeout=60)
+        if probe.returncode:
+            problems.append(f'documents are enabled but {venv(cfg).name} cannot import pypdfium2, PIL and httpx '
+                            '(install requirements-documents.txt)')
     if cfg.get('checkpoint_overlay'):
         from checkpoint_overlay import check
         try:
@@ -549,6 +557,11 @@ def engine():
     from sglang.srt.utils import kill_process_tree
     load_plugins()
     server_args = prepare_server_args(sys.argv[2:])
+    if config().get('enable_documents') and server_args.node_rank == 0:
+        from documents import install
+        install(api_key=API_KEY.read_text().strip(), context_length=config()['context_length'])
+    # Starlette inserts middleware at the front. Search must see the original
+    # user text, before documents expand, so page text never becomes its query.
     if config().get('enable_web_search') and server_args.node_rank == 0:
         from web_search import install
         install(api_key=API_KEY.read_text().strip(), exa_api_key=EXA_KEY.read_text().strip())
@@ -892,6 +905,7 @@ def status(cfg):
         sampling = sampling + ' (requests override)' if sampling else "SGLang's (temperature 1, top_p 1)"
         print(f'Engine: {engine} ({venv(cfg).relative_to(ROOT)}); sampling defaults: {sampling}')
         print(f'Anthropic extras: web search {"Exa" if cfg.get("enable_web_search") else "off"}; '
+              f'documents {"PDF text + page images" if cfg.get("enable_documents") else "off"}; '
               f'thinking budget {"enforced" if cfg.get("enforce_thinking_budget") else "off"}; '
               f'effort medium -> {cfg.get("medium_effort_as") or "unmapped (HTTP 500)"}')
         print(f'Weights: {weights_summary(cfg, states)[0]}')

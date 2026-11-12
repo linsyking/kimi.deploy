@@ -35,6 +35,7 @@
   "mamba_ssm_dtype": "float32",
   "radix_cache": true,
   "enable_web_search": true,
+  "enable_documents": true,
   "enforce_thinking_budget": true,
   "medium_effort_as": "high",
   "speculative": {

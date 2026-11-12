@@ -23,7 +23,7 @@ PINS = {
     'sglang-kernel': '0.4.10', 'sgl-deep-gemm': '0.2.7',
     'sgl-flash-mla': '1.0.4', 'sgl-deep-ep': '0.1.2.post1', 'nvidia-nccl-cu13': '2.30.7',
     'transformers': '5.19.0', 'compressed-tensors': '0.18.0', 'nvidia-cuda-nvcc': '13.0.88',
-    'nvidia-cuda-runtime': '13.0.96',
+    'nvidia-cuda-runtime': '13.0.96', 'pypdfium2': '5.15.2',  # pypdfium2: documents.py
 }
 DYNBLOCK_MODULES = ('fused_moe_trtllm_sm100', 'trtllm_gen_routing')
 

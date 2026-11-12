@@ -1,0 +1,2 @@
+# Installed in every serving venv (.venvs/sglang, .venvs/sglang-7422c70f). Pillow and httpx already come with SGLang.
+pypdfium2==5.15.2
