@@ -8,8 +8,10 @@ protected by the key in `.secrets/api-key`. Tunable values are in `serving.json`
 - Checkpoint: moonshotai/Kimi-K3.1-Pro @ d9e99b0792a5e93b78ea9bea62a68167e36ddd9e (1.561 TB)
 - Draft (DFLASH, stage 2): RadixArk/Kimi-K3.1-Dflash2-Preview @ ea257b38a8ee755b65287bb8ccd0938b519ce26b
 - Serving: DFLASH x8, 32 running requests, radix prefix cache on (stage 3), no HiCache
-- Engine: SGLang `kimi-k3.1-day-0` @ 8b180ca9e07e, from source in a uv venv (no containers)
-- Weights: official shards plus pqhaz's abliteration overlay, active since 2026-11-11 (see Weights)
+- Engine: SGLang `kimi-k3.1-day-0` @ 7422c70f50bc in `.venvs/sglang-7422c70f`, from source in a uv venv
+  (no containers); the first build, 8b180ca9e07e in `.venvs/sglang`, is kept for rollback
+- Weights: official shards plus pqhaz's abliteration overlay, active since 2026-11-11 (see Weights);
+  it corrupts long structured output such as OBJ and SVG files
 
 Current state and measurements are in DEPLOYMENT_STATUS.md.
 
@@ -33,6 +35,14 @@ Run these on c04, in this directory:
     ./claude_code_check.py  # the Claude Code CLI through a recording relay: limits, WebSearch, thinking
     ./bench.sh <label>      # bench_serving 8K in / 1K out at concurrency 1, 8, 32, 64
     ./prefix_bench.py <label>  # multi-turn prefix reuse: TTFT per turn and cache counters
+
+Diagnostics for output corruption (DEPLOYMENT_STATUS.md, "Claude Code mess"); each writes under `.runs/`:
+
+    ./long_output_check.py  # long OBJ and SVG files written through a tool call, checked line by line
+    ./edit_copy_check.py    # Read-then-Edit replay: how often old_string is not in the file
+    ./claude_code_trace.py  # whole Claude Code sessions on a fixture project, every tool call kept
+    ./decode_drift_check.py # greedy decodes re-scored by one prefill: tokens the prefill ranks low
+    ./determinism_check.py  # one saved sequence prefilled several times: run-to-run logprob noise
 
 Each node runs one rank in a tmux session (`kimi-c04` ... `kimi-c14`) on the node-local
 socket `.runs/kimi-tmux`, logging to `sglang.log` in this directory on that node; earlier
@@ -68,7 +78,7 @@ append raw SGLang flags and environment variables for experiments. Setting `spec
 `{"algorithm": "DFLASH", "draft_model_path": "/scratch_local/user_data/yiming/models/Kimi-K3.1-Dflash2-Preview", "num_draft_tokens": 8}`
 enables stage-2 speculative decoding. `radix_cache: true` (stage 3) keeps prompt prefixes on the
 GPUs; with `--mamba-max-states-per-path 1` each cached conversation holds one KDA state, and
-SGLang sizes 221 state slots, which leaves 8.04M KV tokens (14.3M without the cache). `context_length` is
+SGLang sizes 224 state slots, which leaves 8.10M KV tokens on 7422c70f (8.04M and 221 slots on 8b180ca9; 14.3M without the cache). `context_length` is
 1,046,528 (2^20 − 2,048), not the model's 1,048,576. With DCP16, the sparse-attention indexer scores
 one row of 1,024-position blocks per request, 64-token pages across 16 GPUs. The request table also
 keeps headroom past the context for the DFLASH draft tokens. SGLang's deterministic top-k
@@ -85,7 +95,12 @@ key in `.secrets/admin-api-key`, which is not shared; `/health` and `/metrics` n
 user's request the key and the endpoint URL (nothing else) are also published, readable by
 every user on c04, in `/scratch_local/user_data/kimi-k3.1-pro-endpoint.txt`. After `init-key` and a
 restart, rewrite that file too, or it will hand out a dead key. Sampling is
-fixed by the model (temperature 1.0, top_p 0.95); don't override it. `reasoning_effort` takes
+fixed by the model (temperature 1.0, top_p 0.95); don't override it. The checkpoint's
+`generation_config.json` carries no sampling values, so SGLang would otherwise use top_p 1.0 for a
+client that sends none (Claude Code sends none). `default_sampling` in serving.json makes
+1.0 / 0.95 the model's defaults (kimictl patches `ModelConfig.get_default_sampling_params`;
+`--preferred-sampling-params` does not work here because the chat path fills top_p in first), and
+values a request sends still win. `reasoning_effort` takes
 `low`, `high` or `max` (default `max`); `minimal` maps to `low`, `medium` to `high` and `xhigh`
 to `max`. The effort is a prompt instruction to the model, not a token limit. The engine branch
 passes `medium` through as a K3.1 tier that this checkpoint's encoder (`encoding_k3.py`) rejects
@@ -155,8 +170,25 @@ reproducing the Python layer of the branch's `docker/k31.Dockerfile` with uv:
 `verify_venv.py [--gpu]` checks the pins, the K3.1 model class, TreeCore, DynBlock and the
 toolchain on a node. `replicate_venv.sh` rsyncs the venv (and the uv Python if missing) to the
 same path on c11, c13 and c14 and runs the check there. Kernel caches are node-local under
-`.runs/kernel-cache/sglang`; the launcher sets `HOME` to the scratch home because
+`.runs/kernel-cache/<venv>`; the launcher sets `HOME` to the scratch home because
 non-interactive SSH gets the NFS home.
+
+Another commit builds beside the first venv, which stays untouched:
+
+    git -C .src/sglang worktree add ../sglang-<short> <commit>
+    KIMI_VENV=$PWD/.venvs/sglang-<short> KIMI_SGLANG_SRC=$PWD/.src/sglang-<short> \
+        KIMI_SGLANG_COMMIT=<commit> ./build_venv.sh
+    KIMI_VENV=$PWD/.venvs/sglang-<short> ./replicate_venv.sh   # safe beside a live server
+
+`"venv"` in serving.json names the venv under `.venvs` that every rank runs (default `sglang`);
+change it and restart to switch or roll back. The service runs `sglang-7422c70f`, the branch head
+of 2026-11-11, with the same dependency pins as 8b180ca9 (DEPLOYMENT_STATUS.md). `replicate_venv.sh`
+binds rsync to Grace RAM on both ends and skips the GPU check unless `KIMI_VERIFY_GPU=1`, so it
+can run while the service is up. kimictl's runtime engine patches are tested against a venv with
+`CUDA_VISIBLE_DEVICES='' .venvs/<venv>/bin/python -m unittest test_engine_patches.py`. One of them
+exists for 7422c70f only: that commit removed `need_lse` from `dcp_trtllm_sparse_attention`, but the
+DFLASH draft's sliding-window caller still passes it, which fails at startup. kimictl drops the
+keyword in engine processes; on builds that still take it the shim does nothing.
 
 Tools on every node: `~/.local/bin/{rsync,tmux,uv}` (c14's were copied from c04's conda-forge
 prefix `~/.local/opt/sysutils`). No node has a system rsync, and `~/.local/bin` is not on the
@@ -222,3 +254,13 @@ pqhaz reports a partial refusal reduction: 86/89 refusals before, 37/89 after. B
 (58/60) and HumanEval (30/30) were unchanged. Those figures come from vLLM on ROCm at 4K context
 and low effort, not from this SGLang build. The DFLASH draft was trained on the official model,
 so its acceptance rate may fall.
+
+Measured here, the overlay breaks long structured output (DEPLOYMENT_STATUS.md, "Claude Code mess").
+Same build and flags, with only the weights switched, written through a Write tool call:
+- OBJ spheres: 0/18 valid with the overlay, 16/18 with the official weights. The overlay's files have
+  negative face indices, flipped signs, or stop early.
+- SVGs: 13/18 well-formed with the overlay, 18/18 with the official weights.
+
+It is worst at T=1 but present at T=0, so sampling does not explain it. Short edits and Claude Code
+sessions on a small project were the same with either weights. For coding agents that write long
+files, use `./modelctl official`.

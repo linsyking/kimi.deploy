@@ -50,5 +50,10 @@
     "--mamba-max-states-per-path",
     "1"
   ],
+  "venv": "sglang-7422c70f",
+  "default_sampling": {
+    "temperature": 1.0,
+    "top_p": 0.95
+  },
   "checkpoint_overlay": "/scratch_local/user_data/yiming/kimi.deploy/.runs/abliteration/f9c1b234cd8ab798a1d042e59de8bf7de938f344/overlay.safetensors"
 }

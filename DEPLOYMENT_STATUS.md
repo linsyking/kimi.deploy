@@ -1,10 +1,13 @@
-# Deployment status — 2026-11-10
+# Deployment status — 2026-11-12
 
 Kimi K3.1 Pro, TP16 · DCP16 across c04 (rank 0), c11, c13 and c14, on
 http://10.78.202.32:30000/v1 (model `kimi-k3.1-pro`). Stage 3 (DFLASH, 8 draft tokens, radix
 prefix cache without HiCache) plus the Anthropic web search and thinking budget ported from
-ds.deploy, with pqhaz's abliteration overlay and a 1,046,528-token context, has served since
-18:24 UTC on 2026-11-11 (10:24 PST) and is published through frp on remote port 8313. Every item of the brief's validation checklist passes for all stages.
+ds.deploy, with pqhaz's abliteration overlay and a 1,046,528-token context. Since 03:54 UTC on
+2026-11-12 (19:54 PST on 11-11) it runs SGLang 7422c70f with the model's sampling defaults
+(temperature 1.0, top_p 0.95). It is published through frp on remote port 8313. Every item of the
+brief's validation checklist passes for all stages. The abliteration overlay is what corrupts long
+structured output in Claude Code ("Claude Code mess" below); `./modelctl official` removes it.
 
 | Stage | State |
 |---|---|
@@ -16,6 +19,8 @@ ds.deploy, with pqhaz's abliteration overlay and a 1,046,528-token context, has 
 | 3. Prefix cache | serving with the radix cache; HiCache tried and dropped at the user's decision |
 | Anthropic extras | web search (Exa), thinking budget and a medium-effort mapping; all checks pass |
 | Abliteration overlay | serving since 08:36 UTC on 2026-11-11: pqhaz's patch as a 278-tensor overlay, loaded on all 16 ranks |
+| Engine upgrade | 7422c70f (branch head) serving since 2026-11-12; 8b180ca9 kept for rollback |
+| Claude Code mess | reproduced; caused by the abliteration overlay, measured against the official weights |
 
 ## Pre-flight (2026-11-10 17:54 UTC)
 
@@ -492,6 +497,122 @@ both allow 1,048,576 (`max_position_embeddings`).
   - Tunnel reopened at 10:26:26 PST.
 - Downtime: from about 18:11 to 18:26 UTC, including the failed start.
 
+## Claude Code "mess" (2026-11-12, 01:30–04:10 UTC)
+
+The user reported many "Error editing file" results, needless reads and re-edits, and stray characters
+in Claude Code sessions, worst in long outputs such as an SVG or a 3D model. The tunnel was closed from
+03:04 to 04:05 UTC while the server restarted for the experiments below.
+
+**Cause: the abliteration overlay.** Same build, same flags, same checks, only the weights switched
+(`modelctl`), 7422c70f with DFLASH x8 and the sampling defaults:
+
+| Check | official | abliterated |
+|---|---|---|
+| OBJ sphere valid, T=1 top_p=1 | 5/6 | 0/6 |
+| OBJ valid, client default (now T=1, top_p 0.95) | 5/6 | 0/6 |
+| OBJ valid, T=0 | 6/6 | 0/6 |
+| OBJ face lines with a negative index, all 18 trials | 0 | 413 |
+| SVG well-formed, T=1 top_p=1 | 6/6 | 3/6 |
+| SVG well-formed, client default | 6/6 | 4/6 |
+| SVG well-formed, T=0 | 6/6 | 6/6 |
+| Edit old_string miscopied of 48: T=1 top_p=1 / client default / T=0 | 1 / 3 / 0 | 1 / 3 / 1 |
+| Claude Code sessions with a failed tool call | 0/4 | 0/4 |
+| `anthropic_check.py --only budget` runs passed | not run | 3/5 |
+
+- long_output_check.py: 6 trials per condition, effort low. Each trial is a Write tool call of an OBJ
+  sphere (362 vertices, faces with 1-based indices) or of an SVG.
+  - Abliterated corruption:
+    - negative face indices (`f 1 -2 3`, `f -1 -8 -9`), often repeated for hundreds of lines once they
+      start;
+    - sign flips that put vertices off the sphere;
+    - files that stop after 3 to 71 vertices;
+    - SVGs that are not well-formed XML;
+    - one run to max_tokens that left the tool call's JSON unterminated.
+  - The official weights' two failures both wrote too few vertices (242 and 266 of 362), with nothing
+    malformed.
+  - Neither variant produced a stray non-ASCII or control character in this comparison.
+  - The 8b180ca9 build with the abliterated weights gave the same picture before the upgrade: OBJ 0/6 at
+    T=1 top_p=1 and 0/6 at T=0, with 467 and 23 negative face lines; SVG 5/6 and 6/6. An earlier run there
+    (01:38 UTC) wrote `M7身体素质 0 0` into an SVG path at top_p 1.0, the "error characters" the user saw.
+- edit_copy_check.py: 48 trials; a Read tool result, then one Edit of a given line range. A miscopy is an
+  old_string that is not in the file ("String to replace not found"). This does not separate the weights:
+  about 3% of edits miscopy with either. Most miscopies write part of the requested change (the
+  `  # reviewed` comment) into old_string, or drop or add a line at the end of the range. Claude Code
+  then re-reads and retries, which accounts for some of the "Error editing file" results and the extra
+  reads; it is not specific to the overlay.
+- claude_code_trace.py: 4 Claude Code sessions on a fixture project (rename, a bug fix, CJK comments, a
+  new flag). Neither variant failed a call in 4 sessions of 4–6 requests each.
+- budget: the reasoning is cut at the budget every time. In 5 of 20 budgeted answers, though, the
+  abliterated model kept reasoning in the visible answer ("Need not hallucinate. Let's systematically
+  derive.") until max_tokens. 3 of 5 runs at 04:02–04:04 UTC passed, as did the one at 03:00 UTC on the
+  same configuration. Claude Code sends no numeric budget to this model.
+
+**What it is not.**
+
+- Sampling: Moonshot fixes temperature 1.0 and top_p 0.95, but `generation_config.json` has no sampling
+  values, so a client that sends none, as Claude Code does, got top_p 1.0. That is now fixed
+  (`default_sampling`, README "API"). It is not the cause: the abliterated weights corrupt the OBJ at
+  T=0 too.
+- Other flags: they match the SGLang cookbook, the vLLM recipe, Moonshot's K3.1 Pro quickstart and the
+  DFlash2 draft README. That covers TP16·DCP16, FP8 KV with page size 64 (SGLang forces both for K3.1),
+  FP32 KDA state, the `kimi_k3` parsers, the default attention and MoE backends, and the DFLASH flags.
+  One difference remains: block verification is on, as in the draft README, while the NVIDIA cookbook
+  cells and the K3.1 B300 CI test leave it out (only AMD uses it). `speculative.block_verification:
+  false` turns it off.
+- The engine version: 8b180ca9 was 145 commits behind the branch head 7422c70f. Three of the missing
+  fixes touch this code path: #49299 (a reused request row reset while the overlap scheduler's previous
+  forward still writes it), #48860 (full CUDA graphs reading freed dummy-batch inputs) and #49309 (KDA
+  states committed to the slots a speculative verify used). The upgrade changed none of the
+  measurements in the next item.
+- DFLASH and the decode path. decode_drift_check.py runs 16 greedy OBJ generations, 8 at a time, then
+  scores each in one prefill. It counts emitted tokens that trail the prefill's top-1 by 1 nat or more,
+  all with the abliterated weights:
+  - 8b180ca9 with DFLASH: 86 in 196,851 tokens;
+  - 7422c70f with DFLASH: 91 in 203,753;
+  - 7422c70f without DFLASH: 124 in 198,895.
+
+  Nearly all of these are `' '` against `' -'` before a number. For the two worst such tokens of one
+  generation, a fresh prefill of the clean prefix followed by greedy decode emits the same token again,
+  at 0, 16 and 256 tokens back. So decode computes them from the text and not from stale KV, indexer or
+  KDA state. Truncated prefills of the same sequence (2K to 9K tokens) agree with the full one as
+  closely as a repeat of the full one does, so prefill is causal.
+- The custom collectives. determinism_check.py prefills one saved 12,217-token sequence 4 times, each on
+  a flushed cache. About 39% of positions are bit-identical between runs; 16 to 24 top-1s change, and 1
+  to 4 positions move by more than 1 nat (8.4 at most). The worst positions are again sign tokens. With
+  every collective on NCCL (`SGLANG_K3_AR_FUSION=0`, `--disable-custom-all-reduce`,
+  `--dcp-comm-backend ag_rs`, and the `KIMI_DCP_TOPK_NCCL=1` diagnostic in place of the multicast
+  all-gather) it is as noisy or worse: 4,435–4,620 identical positions, 2 to 7 over 1 nat, 6.6 at most.
+
+So the engine has ordinary run-to-run numerical noise (non-deterministic reductions), which a correct
+model shrugs off. The abliterated weights leave the sign decision in coordinate-heavy output close to a
+tie, so that noise and sampling tip it, and once one negative index appears the model keeps copying the
+pattern. The official weights keep a margin.
+
+**Engine upgrade (kept).** 7422c70f was built in its own venv, `.venvs/sglang-7422c70f`, from a git
+worktree. It has the same pins as 8b180ca9; the CUDA changes are JIT kernels only. The build finished at
+02:33 UTC and was replicated to c11, c13 and c14 beside the live server.
+- First start, 02:35 UTC: every rank failed in startup with `trtllm_batch_decode_with_kv_cache_mla() got
+  an unexpected keyword argument 'need_lse'` (see README, Environment). kimictl stopped the ranks, and
+  every GPU came back free.
+- Second start, 02:49 UTC, with the shim: ready. `smoke_test.py` and `anthropic_check.py` pass (budget on
+  a rerun with the venv's Python, which it needs for the tokenizer). Decode
+  runs at 172 tok/s median for one request. There are 506,496 KV tokens per rank (8.10M in total) and
+  224 KDA state slots.
+- `.venvs/sglang` (8b180ca9) stays for rollback: set `"venv": "sglang"` and restart.
+
+Restarts. Every stop was graceful except the failed start, where `kimictl start` forces the stop of the
+ranks left blocked on the dead ones. Every GPU came back free before each start:
+- 02:35 UTC: 7422c70f, failed start;
+- 02:49 UTC: 7422c70f;
+- 03:03 UTC: without DFLASH;
+- 03:29 UTC: without DFLASH, all collectives on NCCL;
+- 03:36 UTC: official weights, DFLASH back;
+- 03:48 UTC: abliterated weights.
+
+Each took about 6 minutes to become ready. The tunnel was open from 03:00:43 to 03:04 UTC and again from
+04:05:05 UTC, after `smoke_test.py` and `anthropic_check.py` passed on the final configuration (budget
+as above), with no errors in any node's log.
+
 ## Public access (frp)
 
 `kimictl tunnel start` at 19:55 UTC, once stage 2 passed its checks: config check (exactly the
@@ -512,14 +633,23 @@ log, doc, state file or commit.
 Closed by the 20:29 PST restart and reopened at 20:40:59 PST after the checks above:
 `login to server success`, `[kimi-c04-30000-to-8313] start proxy success`.
 
+The diagnosis restarts on 2026-11-12 closed it twice. It was reopened at 03:00:43 UTC on the first
+7422c70f server and closed at 03:04 UTC. It was reopened again at 04:05:05 UTC (20:05:05 PST) on the
+final server: `login to server success`, `[kimi-c04-30000-to-8313] start proxy success`.
+
 At the user's request the API key and the endpoint URL, and nothing else (no frp details), are
 in `/scratch_local/user_data/kimi-k3.1-pro-endpoint.txt`, mode 0644, readable by every user on c04.
 
 ## Next
 
-- The service runs the abliterated overlay; its effect on quality and on DFLASH acceptance is unmeasured (no benchmarks, at the user's request).
-- `/dev/shm` on c04 holds rank 0's leftover queue files from three stopped runs (192 KB each run);
-  deleting them, now or in `kimictl stop`, waits on the user.
+- The service runs the abliterated overlay. It breaks long structured output: OBJ 0/18 valid against
+  16/18 with the official weights, SVG 13/18 against 18/18 ("Claude Code mess"). Keeping it or
+  switching with `./modelctl official` is the user's decision. Its DFLASH acceptance is unmeasured.
+- Block verification stays on (the draft README) although the NVIDIA recipes leave it out;
+  `speculative.block_verification: false` and a restart would match them.
+- `/dev/shm` on c04 holds rank 0's leftover queue and semaphore files from the stopped runs, 129 files
+  but only a few MB on disk (they are sparse); deleting them, now or in `kimictl stop`, waits on the
+  user.
 - HiCache is worth another look only for more than about 200 live long conversations or more than
   8M cached tokens.
 - With 8.1M KV tokens, about 8 conversations near the full 1M context fit at once.

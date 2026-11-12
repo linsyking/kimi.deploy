@@ -5,7 +5,9 @@ Each request greedily decodes an OBJ sphere (the DFLASH path, several requests i
 rows are reused under load). After one cache flush, each output is scored in a single prefill pass:
 an emitted token that is not the prefill's top-1 is a disagreement, and one whose logprob trails
 the top-1 by a nat or more is a large one. Numerics differ between the two paths, so near-ties
-flip; large ones should not. Also counts face lines with a negative index, the visible symptom.
+flip. Large ones need determinism_check.py beside them: on this deployment one and the same
+prefill moves a few sign tokens by several nats from run to run. Also counts face lines with a
+negative index, the visible symptom.
 Stdlib only; on c04. Reads the keys in-process.
 
     decode_drift_check.py [--requests 16] [--concurrency 8]"""
