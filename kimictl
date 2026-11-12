@@ -155,6 +155,19 @@ if os.environ.get('KIMI_ENGINE') == '1':
 
         dsa_dcp.dcp_trtllm_sparse_attention = dcp_trtllm_sparse_attention
 
+# Diagnostic (extra_env KIMI_DCP_TOPK_NCCL=1): DCP16 has no one-kernel top-k merge (it needs 8
+# ranks), so decode gathers every rank's DSA top-k candidates with PyTorch's NVLink-multicast
+# all-gather across the four trays. This sends that gather through the group's NCCL all-gather.
+if os.environ.get('KIMI_ENGINE') == '1' and os.environ.get('KIMI_DCP_TOPK_NCCL') == '1':
+    from sglang.srt.layers.attention.dsa import dsa_dcp_sharded
+    multicast_init = dsa_dcp_sharded.DcpCandidateAllGather.__init__
+
+    def nccl_candidate_gather(self, group, max_rows, topk):
+        multicast_init(self, group, max_rows, topk)  # its rendezvous is collective; keep it
+        self.out, self.prefix_handle = None, None  # __call__ then uses group.all_gather
+
+    dsa_dcp_sharded.DcpCandidateAllGather.__init__ = nccl_candidate_gather
+
 # Moonshot serves K3.1 Pro with temperature 1.0 and top_p 0.95 fixed and tells clients to omit
 # them, but the checkpoint's generation_config.json has no sampling fields, so a client that sends
 # none (Claude Code) would sample at SGLang's top_p 1.0. Supply them as the model's defaults, as
