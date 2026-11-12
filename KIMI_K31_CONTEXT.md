@@ -70,7 +70,7 @@ Serve `moonshotai/Kimi-K3.1-Pro` as one SGLang server spanning 4 GB200 trays (16
 
 ## Reference material on c04 (read it; don't run it as-is)
 
-- **`/scratch_local/user_data/yiming/reference/ds.deploy`**: the live DeepSeek-V4.1-Flash deployment from c02. It's a git clone plus the current uncommitted working tree, verified identical. `.secrets`, `.venvs`, `.runs` and logs were not copied.
+- **`/scratch_local/user_data/yiming/reference/ds.deploy`**: the live DeepSeek-V4.1-Flash deployment from c02. It's a git clone plus the current uncommitted working tree, verified identical. It was re-synced on 2026-11-12 at `bed126d`, which adds PDF/document support. `.secrets`, `.venvs`, `.runs` and logs were not copied.
   - `ds41ctl` is the controller: tmux engine session, start/stop/status, refuses to start if GPUs are busy or a recovery action is pending. Its `launch_environment()` function builds the CUDA 13 toolchain and cache environment.
   - Also: `serving.json`, `modelctl`, `README.md`, `DEPLOYMENT_STATUS.md`.
   - Its venv runs Python 3.11 (uv) with: sglang 0.5.23 (PyPI), sglang-kernel 0.4.10, flashinfer-python 0.7.2 plus flashinfer-jit-cache 0.7.2+cu130, sgl-deep-gemm 0.2.3.post2, sgl-flash-mla 1.0.0, sgl-deep-ep 0.1.2.post1, torch 2.14.1, nvidia-nccl-cu13 2.30.7 and cuda-python 13.4.4.
@@ -132,6 +132,7 @@ K3.1 support comes from SGLang's day-0 work, merged to `main` on Nov 4 in PR #48
 5. **Replicate the venv.** It must exist at the same absolute path on all 4 nodes. Build it once on c04, then copy it with `tar | ssh` to the same path on the other three, together with the uv-managed Python it points to (`~/.local/share/uv/python/cpython-*`; see `pyvenv.cfg`). c14 has no uv Pythons yet.
 6. **Extras from `ds.deploy`:**
    - Port the Anthropic web search and the thinking budget; see "Anthropic web search and thinking budget" below.
+   - Port PDF and text document support; see "PDF and text documents" below. It needs `pypdfium2==5.15.2` in the serving venv on all 4 nodes.
    - `ds.deploy`'s other extras (MTI decoding, checkpoint overlay) are DeepSeek-specific. Don't port them unless the user asks.
    - Don't modify files inside the installed SGLang package; patch at runtime, as `ds.deploy` does.
 
@@ -304,6 +305,71 @@ Neither feature modifies the SGLang package. Both patch SGLang classes at runtim
 - a request without the search tool that makes no Exa call;
 - a budgeted thinking request and an unbudgeted one.
 
+## PDF and text documents (port from `ds.deploy`)
+
+Added 2026-11-12. Today `ds.deploy` gained Anthropic document support (commit `bed126d`, "feat: support Anthropic PDF and text documents"). `reference/ds.deploy` on c04 has been re-synced to that commit plus c02's current uncommitted changes; all 32 files are checksum-identical to c02. **The user wants the same feature in `kimi.deploy`.** Copy the code from the reference rather than reimplementing it.
+
+**What it does** (`documents.py`, 349 lines; the README section "PDF and text documents" has the full description):
+- **Where it hooks in:** an ASGI middleware on `/v1/messages` and `/v1/messages/count_tokens`.
+- **What it accepts:** Anthropic `document` blocks, both as user attachments and inside `tool_result.content`. Claude Code's Read tool sends PDFs the second way.
+- **What it produces:** before SGLang validates the request, each PDF page is expanded into two blocks:
+  - a text block with the page's extracted text, its page number, and the document's title and context;
+  - an image block of the same page.
+  - This follows Anthropic's text-plus-page-image design. Scanned pages keep their image even when no text can be extracted.
+- **Supported sources:** base64 `application/pdf`, HTTP(S) PDF URLs, base64 UTF-8 `text/plain`, and `source: {"type": "text", "data": ...}`.
+- **Not supported:**
+  - Files API `file_id` references.
+  - Citation events: requests that enable citations get a clear 400.
+  - Invalid or encrypted PDFs, which are rejected rather than silently replaced with empty text.
+- **Rendering and limits:**
+  - PDFium via `pypdfium2`, at 144 DPI, capped at 2048 px per edge and 4 MP per page, JPEG quality 92.
+  - Rendering runs off the event loop with serialized PDFium access, because PDFium isn't thread-safe, and at most 2 workers.
+  - A 128 MiB, 10-minute cache keyed by the PDF bytes avoids re-rendering documents repeated in conversation history.
+  - Request limits: 128 MiB of incoming JSON, 96 MiB of decoded documents, 256 MiB of expanded JSON.
+  - Page limit: 600 pages if the context length is at least 1M, otherwise 100. It never truncates silently.
+  - It checks the bearer key before processing, and never logs or stores PDF content.
+- **Token counting:** `count_tokens` keeps SGLang's native estimate, which undercounts vision tokens. The `usage.input_tokens` returned with generations is accurate.
+
+**Wiring in `ds41ctl`:**
+- **Setting:** `serving.json` has `"enable_documents": true`, validated as a bool (lines 118–119).
+- **Preflight** (lines 219–220): the engine's Python must be able to import `pypdfium2`, `PIL` and `httpx`.
+- **Install** (lines 345–352): `_engine` calls `documents.install(api_key=..., context_length=...)` **before** `web_search.install(...)`.
+  - Starlette puts each newly added middleware in front of the previous ones, so web search ends up outermost.
+  - That way web search sees the original user text before documents are expanded, and page text never becomes an Exa query.
+  - **Keep that order.**
+- **Runtime files:** `documents.py` and `requirements-documents.txt` are in `RUNTIME_FILES` (line 36).
+
+**For Kimi:**
+- **Where:** `kimictl`'s `_engine` installs web search at lines 553–554, just before `run_server` (line 556). Install documents immediately before web search, on rank 0 only, since that node runs the HTTP server.
+- **Also add:**
+  - `documents.py` and `requirements-documents.txt` to `RUNTIME_FILES`;
+  - `enable_documents` to `serving.json`, validated as a bool;
+  - the import preflight.
+- **Dependency:** install `pypdfium2==5.15.2` (from `requirements-documents.txt`) into the serving venv.
+  - That's currently `.venvs/sglang-7422c70f`, per `serving.json`'s `venv` key. Also install it into any other venv you might select.
+  - Neither venv has it today. PIL and httpx are already there.
+  - It's a small CPU-only wheel from PyPI.
+  - Keep the venv copies on all 4 nodes identical.
+- **Compatibility, already checked on the 7422c70f build:**
+  - It has no native `document` support, so the adapter is needed.
+  - `AnthropicMessagesRequest`, `AnthropicCountTokensRequest`, `AnthropicServing` and the `/v1/messages/count_tokens` route all exist.
+  - `ToolResultBlock.content` is `Union[str, list[AnthropicContentBlock]]`, the same as in 0.5.23, so images inside tool results validate.
+- **The adapter is model-agnostic.** It emits standard Anthropic image blocks and relies on Kimi's native image path, which your `anthropic_check.py` `vision` check already covers. `documents.py` itself has nothing DeepSeek-specific. Copy it unchanged.
+- **Only the live check needs changes.** `check_documents.py` loads `ds41ctl` with `runpy` to get `config()` and `auth_headers()`. Point it at `kimictl`, which has both (lines 193 and 673).
+- **Measure the page-image cost.** At the current context of 262,144 tokens, the page limit is 100. Kimi's per-page vision cost with MoonViT-V2 isn't known.
+  - Measure `usage.input_tokens` for a 1-page and a 10-page PDF and record tokens per page in `DEPLOYMENT_STATUS.md`.
+  - Tell the user how many pages actually fit in the context.
+- **Restart:** enabling the feature requires restarting the server. If the endpoint is serving users, for example through the frp tunnel, tell the user before you restart.
+
+**Tests:**
+- **Unit:** `test_documents.py` (23 tests) and `test_web_search.py`, run with the serving venv's Python.
+- **Native:** `test_documents_native.py` checks the installed SGLang validator and converter without loading the model. Run it in the deployment's CUDA environment.
+- **Live:** adapt `check_documents.py` to `kimi.deploy`'s endpoint and key.
+  - It generates a two-page PDF whose page 2 holds an image-only code and a bar chart, and checks JSON, SSE and nested Read-tool results.
+  - Save evidence under `audit/documents-*`.
+- **Extend `anthropic_check.py`** with a `documents` check.
+- **Web search with a PDF attached:** confirm the Exa query is the user's text, not the extracted page text.
+
 ## Validation checklist
 
 1. **Pre-flight:**
@@ -317,6 +383,7 @@ Neither feature modifies the SGLang package. Both patch SGLang classes at runtim
    - Chat works with `reasoning_effort` set to low and to max.
    - A tool call works.
    - An image input works.
+   - A PDF works, both as an attachment and nested in a Read `tool_result` (`check_documents.py`). An image-only page is read correctly, and citations get a 400.
    - A ~128K-token needle-in-a-haystack test passes.
    - The 32-concurrency stress test runs without hanging.
 4. **Performance:**
