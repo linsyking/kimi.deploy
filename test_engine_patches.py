@@ -56,6 +56,28 @@ class DefaultSamplingTests(unittest.TestCase):
         self.assertEqual(run(DEFAULTS), [{}, {'top_p': 0.9}, {}])
 
 
+NEED_LSE = '''
+import inspect
+from sglang.srt.layers.attention.dsa import dsa_dcp
+function = dsa_dcp.dcp_trtllm_sparse_attention
+original = getattr(function, '__wrapped__', function)
+passed = None
+if function is not original:
+    module.stale = lambda *args, **kwargs: sorted(kwargs)  # the shim calls kimictl's `stale`
+    passed = function(query=1, need_lse=False)
+print(json.dumps({'takes': 'need_lse' in inspect.signature(original).parameters,
+                  'wrapped': function is not original, 'passed': passed}))
+'''
+
+
+class NeedLseShimTests(unittest.TestCase):
+    def test_drops_the_keyword_only_where_it_is_gone(self):
+        result = run(NEED_LSE, KIMI_ENGINE='1')
+        self.assertEqual(result['wrapped'], not result['takes'])
+        if result['wrapped']:
+            self.assertEqual(result['passed'], ['query'])
+
+
 class MediumEffortTests(unittest.TestCase):
     def test_medium_maps_to_configured_tier(self):
         tiers = run(TIERS, KIMI_MEDIUM_EFFORT='high')

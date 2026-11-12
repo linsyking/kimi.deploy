@@ -139,6 +139,22 @@ if os.environ.get('KIMI_MEDIUM_EFFORT'):
         tiers = serving_kimi_k3._KIMI_K31_LEVEL_BY_TIER
     tiers['medium'] = os.environ['KIMI_MEDIUM_EFFORT']
 
+# The branch's clean-up aa6bae9ee7 dropped need_lse from dcp_trtllm_sparse_attention, which now
+# always returns the LSE, but the DFLASH draft's sliding-window caller still passes it and FlashInfer
+# rejects the keyword, so DCP + DFLASH fails at startup. Drop it; under DCP the caller asks for the
+# LSE anyway. A no-op on builds whose function still takes need_lse.
+if os.environ.get('KIMI_ENGINE') == '1':
+    import functools
+    import inspect
+    from sglang.srt.layers.attention.dsa import dsa_dcp
+    stale = dsa_dcp.dcp_trtllm_sparse_attention
+    if 'need_lse' not in inspect.signature(stale).parameters:
+        @functools.wraps(stale)
+        def dcp_trtllm_sparse_attention(*args, need_lse=True, **kwargs):
+            return stale(*args, **kwargs)
+
+        dsa_dcp.dcp_trtllm_sparse_attention = dcp_trtllm_sparse_attention
+
 # Moonshot serves K3.1 Pro with temperature 1.0 and top_p 0.95 fixed and tells clients to omit
 # them, but the checkpoint's generation_config.json has no sampling fields, so a client that sends
 # none (Claude Code) would sample at SGLang's top_p 1.0. Supply them as the model's defaults, as
@@ -433,6 +449,8 @@ def launch_environment(cfg):
         CC='/usr/bin/gcc-12', CXX='/usr/bin/g++-12',
         # The wheel bundles the Rust extensions; workers have no Cargo (as in the k31 image).
         SGLANG_RUST_BUILD_MODE='never',
+        # Enables the import-time engine shims above (engine processes only).
+        KIMI_ENGINE='1',
         # InferenceX fix for the TP16 CUDA-graph crash in the sharded MoE front (N=1048 slice GEMM).
         SGLANG_K3_SHARDED_MOE='0',
         NCCL_MNNVL_ENABLE='1', NCCL_CUMEM_ENABLE='1',
