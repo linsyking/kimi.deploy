@@ -451,6 +451,28 @@ quality report. Sizes are the HF API's per-file sizes (an earlier, truncated lis
 
 Only pqhaz's patch avoids a new full 1.56 TB download. Its quality samples are too small to show a drop of a few points, so "unchanged" there is a weak claim.
 
+Rechecked on 2026-11-12, by HF API and shard hashes against our manifest. No K3.1 Pro LoRA, adapter or
+steering vector exists (no repo has `base_model:adapter:moonshotai/Kimi-K3.1-Pro`).
+- **lyber-ai, new revision 6194fda9 (2026-11-12 03:13 UTC).**
+  - What it fixes: its card says it fixes "noisier tokens than the base model" and repetition loops in
+    long agent sessions. Mean sampled-token logprob is −1.02, against −1.01 for the base model.
+  - MMLU, zero-shot logit mode: 86.41% (previous revision 85.54%); the card gives no base figure in that
+    harness. Its HarmBench 0/320 refusals were measured on the previous revision.
+  - What changed: 68 of its 97 safetensors are byte-identical to the official ones. The 28 changed model
+    shards keep their exact sizes, so tensors were edited in place. They cover every fourth layer from
+    3 to 51 and layers 54–75; a new `dspark/` draft is added.
+  - Access is gated with manual approval, so its index and changed tensors are unreadable without it.
+    With access, only the changed tensors could be range-read rather than the shards (at most 472 GB).
+- **Blackfrost, build a7.0:** weights are now published and unlocked after a $599 purchase. 186 non-expert
+  tensors are edited (α 7.0) plus a cyber SFT, and it still refuses 302/443 (68.2%) on its own bench.
+  No capability data yet.
+- **audnai:** 94 of 96 shards differ from the official ones; it can only be had as a full download.
+- **pqhaz:** unchanged since 2026-11-05. `projection_spec.json` applies 4 refusal directions per layer
+  (`directions/axis00`–`03`, already on disk under `.runs/abliteration/f9c1…/source/`) at α 0.75 to
+  every attention and MoE output writer in all 93 layers. That is much heavier than single-direction
+  abliteration, and it can be rebuilt lighter (fewer directions, a lower α, fewer layers) from the
+  official shards without any download.
+
 - pqhaz's patch, rev f9c1b234cd8ab798a1d042e59de8bf7de938f344, variant `trace4`:
   - It rewrites 278 BF16 tensors in 93 of the 96 shards: 93 `o_proj`, 93 `down_proj` and 92 `routed_expert_up_proj`.
   - It names base revision 6d0a0202. That revision's 96 safetensors and index are byte-identical to ours (d9e99b07); only `encoding_k3.py` differs. The index SHA-256 and every original tensor's SHA-256 match ours.
