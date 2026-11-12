@@ -32,7 +32,7 @@ CONFIG_PATH = ROOT / 'serving.json'
 RUNS = ROOT / '.runs'
 STATE = RUNS / 'service.json'
 LOG = ROOT / 'sglang.log'
-VENV = ROOT / '.venvs/sglang'
+VENVS = ROOT / '.venvs'
 SCRATCH_HOME = '/scratch_local/user_data/yiming'
 LOCAL_BIN = Path(SCRATCH_HOME) / '.local/bin'
 TMUX = LOCAL_BIN / 'tmux'
@@ -58,6 +58,8 @@ TUNNEL_PORT = 8313
 GOST_ADDRESS = ('127.0.0.1', 18080)
 GOST_URL = 'http://127.0.0.1:18080?resolver=https://1.1.1.1/dns-query'
 VERIFIED = '.kimi-verified.json'
+# What generation_config.json can default, and so what default_sampling may set.
+SAMPLING_FIELDS = {'temperature', 'top_p', 'top_k', 'min_p', 'repetition_penalty'}
 GPU_IDLE_MIB = 1024
 # The driver frees a process's GPU memory only after the process is reaped; how long stop waits.
 GPU_RELEASE_SECONDS = 180
@@ -130,7 +132,27 @@ if os.environ.get('KIMI_THINKING_BUDGET') == '1':
 # low, high and max, so such requests failed with HTTP 500. Map it as SGLang maps it for K3.
 if os.environ.get('KIMI_MEDIUM_EFFORT'):
     from sglang.srt.entrypoints.openai import serving_chat
-    serving_chat._KIMI_K31_EFFORT_TIERS['medium'] = os.environ['KIMI_MEDIUM_EFFORT']
+    tiers = getattr(serving_chat, '_KIMI_K31_EFFORT_TIERS', None)
+    if tiers is None:
+        # Later branch commits moved the table into the K3 serving glue.
+        from sglang.srt.entrypoints.openai import serving_kimi_k3
+        tiers = serving_kimi_k3._KIMI_K31_LEVEL_BY_TIER
+    tiers['medium'] = os.environ['KIMI_MEDIUM_EFFORT']
+
+# Moonshot serves K3.1 Pro with temperature 1.0 and top_p 0.95 fixed and tells clients to omit
+# them, but the checkpoint's generation_config.json has no sampling fields, so a client that sends
+# none (Claude Code) would sample at SGLang's top_p 1.0. Supply them as the model's defaults, as
+# generation_config.json would: a request's own values still win.
+if os.environ.get('KIMI_DEFAULT_SAMPLING'):
+    from sglang.srt.configs.model_config import ModelConfig
+    original_defaults = ModelConfig.get_default_sampling_params
+    model_defaults = json.loads(os.environ['KIMI_DEFAULT_SAMPLING'])
+
+    def default_sampling_params(self):
+        params = original_defaults(self)
+        return {**model_defaults, **params} if self.sampling_defaults == 'model' else params
+
+    ModelConfig.get_default_sampling_params = default_sampling_params
 
 # pqhaz's abliteration: every rank's weight loader takes the 278 patched tensors from the overlay
 # (checkpoint_overlay.py); the official shards are read as they are.
@@ -158,7 +180,18 @@ def config():
         raise ValueError('speculative must be null or a DFLASH block')
     if not isinstance(cfg.get('checkpoint_overlay', ''), str):
         raise ValueError('checkpoint_overlay must be a path string or absent')
+    if not re.fullmatch(r'[A-Za-z0-9._-]+', cfg.get('venv', 'sglang')):
+        raise ValueError('venv must be a directory name under .venvs')
+    sampling = cfg.get('default_sampling', {})
+    if not (isinstance(sampling, dict) and set(sampling) <= SAMPLING_FIELDS
+            and all(type(value) in (int, float) for value in sampling.values())):
+        raise ValueError(f'default_sampling must map some of {sorted(SAMPLING_FIELDS)} to numbers')
     return cfg
+
+
+def venv(cfg):
+    """The engine's venv: .venvs/sglang unless the config names another build_venv.sh build."""
+    return VENVS / cfg.get('venv', 'sglang')
 
 
 def head(cfg):
@@ -336,7 +369,7 @@ def runtime_digests():
 def node_preflight(cfg, rank):
     """Problems block a start; warnings are reported only."""
     problems, warnings = [], []
-    required = [VENV / 'bin/python', VENV / 'kimi-build.json', TMUX, NUMACTL]
+    required = [venv(cfg) / 'bin/python', venv(cfg) / 'kimi-build.json', TMUX, NUMACTL]
     required += [root / VERIFIED for root in model_dirs(cfg)]
     if rank == 0:
         required += [API_KEY, ADMIN_KEY, AUTH_CONFIG]
@@ -376,16 +409,17 @@ def node_preflight(cfg, rank):
 
 
 def launch_environment(cfg):
-    site = next((VENV / 'lib').glob('python*/site-packages'))
+    site = next((venv(cfg) / 'lib').glob('python*/site-packages'))
     cuda = site / 'nvidia/cu13'
-    cache = RUNS / 'kernel-cache/sglang'
+    # One kernel cache per venv, so no build loads kernels another SGLang commit compiled.
+    cache = RUNS / 'kernel-cache' / venv(cfg).name
     env = {key: value for key, value in os.environ.items()
            if key not in ('HF_TOKEN', 'NCCL_DEBUG_SUBSYS', 'http_proxy', 'https_proxy', 'all_proxy',
                           'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'PYTHONPATH', 'VIRTUAL_ENV', *OVERLAY_ENV)}
     env.update(
         # Non-interactive SSH sets HOME to the NFS home; keep every default cache on scratch.
         HOME=SCRATCH_HOME, CUDA_HOME=str(cuda), CUDA_PATH=str(cuda),
-        PATH=f'{cuda}/bin:{VENV}/bin:{LOCAL_BIN}:/usr/local/bin:/usr/bin:/bin',
+        PATH=f'{cuda}/bin:{venv(cfg)}/bin:{LOCAL_BIN}:/usr/local/bin:/usr/bin:/bin',
         LD_LIBRARY_PATH=':'.join(filter(None, [f'{cuda}/lib', env.get('LD_LIBRARY_PATH')])),
         TMPDIR=str(RUNS / 'tmp'), HF_HOME=f'{SCRATCH_HOME}/.cache/huggingface',
         HF_HUB_OFFLINE='1', HF_HUB_DISABLE_TELEMETRY='1', TOKENIZERS_PARALLELISM='false',
@@ -408,6 +442,8 @@ def launch_environment(cfg):
         if cfg['medium_effort_as'] not in ('low', 'high', 'max'):
             raise ValueError('medium_effort_as must be low, high or max')
         env['KIMI_MEDIUM_EFFORT'] = cfg['medium_effort_as']
+    if cfg.get('default_sampling'):
+        env['KIMI_DEFAULT_SAMPLING'] = json.dumps(cfg['default_sampling'])
     if cfg.get('enforce_thinking_budget'):
         env['KIMI_THINKING_BUDGET'] = '1'
         # Strict thinking needs a default ceiling; the context length is unreachable, and an
@@ -449,8 +485,9 @@ def engine_args(cfg, rank):
         args += ['--speculative-algorithm', 'DFLASH', '--speculative-draft-model-path', spec['draft_model_path'],
                  '--speculative-draft-attention-backend', 'cutedsl_mla',
                  '--speculative-draft-kv-cache-dtype', cfg['kv_cache_dtype'],
-                 '--speculative-num-draft-tokens', spec['num_draft_tokens'],
-                 '--speculative-use-block-verification', '--enable-linear-replayssm-spec']
+                 '--speculative-num-draft-tokens', spec['num_draft_tokens'], '--enable-linear-replayssm-spec']
+        if spec.get('block_verification', True):
+            args.append('--speculative-use-block-verification')
     args += cfg.get('extra_args', [])
     return [str(value) for value in args]
 
@@ -463,7 +500,7 @@ def serve(cfg, rank):
     # would otherwise spill page cache into HBM mid-load. Device allocations ignore this policy.
     membind = ','.join(path.name[4:] for path in numa_nodes()[0])
     command = [str(NUMACTL), f'--membind={membind}',
-               str(VENV / 'bin/python'), str(ROOT / 'kimictl'), '_engine', *engine_args(cfg, rank)]
+               str(venv(cfg) / 'bin/python'), str(ROOT / 'kimictl'), '_engine', *engine_args(cfg, rank)]
     state = dict(proc_info(os.getpid()), rank=rank, command=command, config=cfg,
                  started_at=time.time(), log=str(LOG), overlay_audit=env.get('KIMI_CHECKPOINT_AUDIT_DIR'))
     temporary = STATE.with_suffix('.tmp')
@@ -813,7 +850,16 @@ def status(cfg):
         print(f'Model: {cfg["served_model_name"]}; TP{cfg["tp_size"]} DCP{cfg["dcp_size"]}; '
               f'context {cfg["context_length"]:,}; max running {cfg["max_running_requests"]}; '
               f'radix cache {"on" if cfg["radix_cache"] else "off"}; '
-              f'decoding {"DFLASH x" + str(spec["num_draft_tokens"]) if spec else "plain"}')
+              f'decoding {"DFLASH x" + str(spec["num_draft_tokens"]) if spec else "plain"}'
+              f'{"" if not spec or spec.get("block_verification", True) else " (token-wise verification)"}')
+        try:
+            build = json.loads((venv(cfg) / 'kimi-build.json').read_text())
+            engine = f'SGLang {build["sglang_branch"]} @ {build["sglang_commit"][:12]}'
+        except (OSError, ValueError, KeyError):
+            engine = 'SGLang build record missing'
+        sampling = ', '.join(f'{key} {value}' for key, value in cfg.get('default_sampling', {}).items())
+        sampling = sampling + ' (requests override)' if sampling else "SGLang's (temperature 1, top_p 1)"
+        print(f'Engine: {engine} ({venv(cfg).relative_to(ROOT)}); sampling defaults: {sampling}')
         print(f'Anthropic extras: web search {"Exa" if cfg.get("enable_web_search") else "off"}; '
               f'thinking budget {"enforced" if cfg.get("enforce_thinking_budget") else "off"}; '
               f'effort medium -> {cfg.get("medium_effort_as") or "unmapped (HTTP 500)"}')

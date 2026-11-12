@@ -21,7 +21,9 @@ import urllib.request
 ROOT = Path(__file__).resolve().parent
 OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 SOURCES = ['smoke_test.py', 'web_search.py']
-CONDITIONS = {'default (T=1, top_p=1)': {}, 'top_p 0.95': {'top_p': 0.95}, 'temperature 0': {'temperature': 0.0}}
+# Explicit fields, so a server-side default changes only 'client default' (what Claude Code sends).
+CONDITIONS = {'T=1, top_p=1': {'temperature': 1.0, 'top_p': 1.0}, 'top_p 0.95': {'temperature': 1.0, 'top_p': 0.95},
+              'temperature 0': {'temperature': 0.0}, 'client default': {}}
 EDIT = {'name': 'Edit', 'description': 'Performs exact string replacements in files. old_string must match the '
         'file exactly, including indentation, and must not include the line-number prefix of Read output.',
         'input_schema': {'type': 'object', 'required': ['file_path', 'old_string', 'new_string'], 'properties': {

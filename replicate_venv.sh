@@ -4,11 +4,19 @@
 #
 #   ./replicate_venv.sh                  c11, c13 and c14 in parallel
 #   ./replicate_venv.sh 10.78.202.42     one node
+#
+# KIMI_VENV copies another build_venv.sh build. While the service runs, rsync on both ends is
+# bound to Grace memory (its page cache would otherwise land in HBM) and the GPU check is skipped
+# unless KIMI_VERIFY_GPU=1.
 set -euo pipefail
 
 ROOT=/scratch_local/user_data/yiming/kimi.deploy
 RSYNC=/scratch_local/user_data/yiming/.local/bin/rsync
-VENV=$ROOT/.venvs/sglang
+VENV=${KIMI_VENV:-$ROOT/.venvs/sglang}
+NUMACTL=/scratch_local/user_data/yiming/.local/opt/sysutils/bin/numactl
+# Grace's NUMA nodes are the ones with CPUs; the GPUs' HBM shows up as CPU-less nodes.
+GRACE_NODES='for n in /sys/devices/system/node/node[0-9]*; do [ -n "$(cat $n/cpulist)" ] && echo ${n##*node}; done | paste -sd,'
+VERIFY_GPU=${KIMI_VERIFY_GPU:-0}
 PYDIR=$(dirname "$(sed -n 's/^home = //p' "$VENV/pyvenv.cfg")")
 SSH="ssh -o BatchMode=yes -o ConnectTimeout=10"
 WORKERS=("$@")
@@ -28,9 +36,14 @@ replicate() {
         echo "error: $PYDIR differs from c04's; refusing to overwrite it" >&2
         return 1
     fi
-    $RSYNC -a --delete --mkpath -e "$SSH" --rsync-path="$RSYNC" "$VENV/" "$node:$VENV/"
+    local here there
+    here=$(bash -c "$GRACE_NODES")
+    there=$($SSH "$node" "$GRACE_NODES")
+    [ -n "$here" ] && [ -n "$there" ] || { echo "no Grace NUMA nodes found" >&2; return 1; }
+    "$NUMACTL" --membind="$here" $RSYNC -a --delete --mkpath -e "$SSH" \
+        --rsync-path="$NUMACTL --membind=$there $RSYNC" "$VENV/" "$node:$VENV/"
     $RSYNC -a -e "$SSH" --rsync-path="$RSYNC" "$ROOT/verify_venv.py" "$node:$ROOT/"
-    $SSH "$node" "$VENV/bin/python -I $ROOT/verify_venv.py --gpu"
+    $SSH "$node" "KIMI_VENV=$VENV $VENV/bin/python -I $ROOT/verify_venv.py $([ "$VERIFY_GPU" = 1 ] && echo --gpu)"
 }
 
 pids=()

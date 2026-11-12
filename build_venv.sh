@@ -5,21 +5,24 @@
 #
 #   ./build_venv.sh            install from requirements-sglang.lock
 #   ./build_venv.sh --relock   re-resolve the lock from the checkout's pyproject first
+#
+# KIMI_VENV, KIMI_SGLANG_SRC and KIMI_SGLANG_COMMIT build another commit beside the default venv,
+# e.g. from a git worktree; serving.json's "venv" then selects it.
 set -euo pipefail
 
 ROOT=/scratch_local/user_data/yiming/kimi.deploy
 LOCAL=/scratch_local/user_data/yiming/.local
 UV=$LOCAL/bin/uv
 RUST_BIN=$LOCAL/opt/rust/bin
-SRC=$ROOT/.src/sglang
-VENV=$ROOT/.venvs/sglang
+SRC=${KIMI_SGLANG_SRC:-$ROOT/.src/sglang}
+VENV=${KIMI_VENV:-$ROOT/.venvs/sglang}
 PY=$VENV/bin/python
 BUILD=$ROOT/.runs/build
 LOCK=$ROOT/requirements-sglang.lock
 
 SGLANG_REPO=https://github.com/sgl-project/sglang.git
 SGLANG_BRANCH=kimi-k3.1-day-0
-SGLANG_COMMIT=8b180ca9e07e108d0600096aa1c3adda9e72513d
+SGLANG_COMMIT=${KIMI_SGLANG_COMMIT:-8b180ca9e07e108d0600096aa1c3adda9e72513d}
 PYTHON_VERSION=3.12.13
 FLASHINFER_VERSION=0.7.3
 NCCL_VERSION=2.30.7
@@ -39,7 +42,7 @@ step() { printf '\n==> %s\n' "$*"; }
 pip_install() { "$UV" pip install --python "$PY" "$@"; }
 
 step "Source: $SGLANG_BRANCH @ ${SGLANG_COMMIT:0:12}"
-if [ ! -d "$SRC/.git" ]; then
+if [ ! -e "$SRC/.git" ]; then  # a worktree's .git is a file
     git clone --filter=blob:none -b "$SGLANG_BRANCH" "$SGLANG_REPO" "$SRC"
     git -C "$SRC" checkout -q --detach "$SGLANG_COMMIT"
 fi
@@ -113,4 +116,4 @@ cat > "$VENV/kimi-build.json" <<EOF
 EOF
 
 step "Verify"
-"$PY" -I "$ROOT/verify_venv.py"
+KIMI_VENV=$VENV "$PY" -I "$ROOT/verify_venv.py"

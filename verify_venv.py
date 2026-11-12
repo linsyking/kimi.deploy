@@ -5,6 +5,7 @@ Run with the venv's interpreter; --gpu adds a CUDA/NCCL smoke test on GPU 0."""
 import argparse
 import hashlib
 import json
+import os
 import re
 import subprocess
 import sys
@@ -13,7 +14,7 @@ from importlib import metadata
 from pathlib import Path
 
 ROOT = Path('/scratch_local/user_data/yiming/kimi.deploy')
-VENV = ROOT / '.venvs/sglang'
+VENV = Path(os.environ.get('KIMI_VENV', ROOT / '.venvs/sglang'))
 SITE = Path(sysconfig.get_paths()['purelib'])
 CUDA = SITE / 'nvidia/cu13'
 PINS = {

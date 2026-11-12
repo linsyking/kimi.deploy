@@ -21,7 +21,9 @@ import xml.etree.ElementTree as ET
 
 ROOT = Path(__file__).resolve().parent
 OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-CONDITIONS = {'default (T=1, top_p=1)': {}, 'top_p 0.95': {'top_p': 0.95}, 'temperature 0': {'temperature': 0.0}}
+# Explicit fields, so a server-side default changes only 'client default' (what Claude Code sends).
+CONDITIONS = {'T=1, top_p=1': {'temperature': 1.0, 'top_p': 1.0}, 'top_p 0.95': {'temperature': 1.0, 'top_p': 0.95},
+              'temperature 0': {'temperature': 0.0}, 'client default': {}}
 WRITE = {'name': 'Write', 'description': 'Writes a file to the local filesystem, overwriting it.',
          'input_schema': {'type': 'object', 'required': ['file_path', 'content'], 'properties': {
              'file_path': {'type': 'string'}, 'content': {'type': 'string'}}}}
@@ -104,7 +106,10 @@ def trial(cfg, key, task, sampling, effort):
              for pattern in (STRAY, SPECIAL) for match in pattern.finditer(content)]
     problems = (check_obj if task == 'obj' else check_svg)(content)
     outcome = 'clean' if not problems and not stray else ('stray characters' if stray else 'invalid file')
+    # A minus sign inside a face line is the decode-drift symptom; OBJ faces here never need one.
+    face_minus = sum(line.startswith('f ') and '-' in line for line in content.splitlines())
     return {'task': task, 'outcome': outcome, 'stop': stop, 'output_tokens': usage.get('output_tokens'),
+            'face_minus': face_minus,
             'stray': stray[:5], 'stray_count': len(stray), 'problems': problems[:5], 'problem_count': len(problems)}
 
 
@@ -129,7 +134,9 @@ def main():
                 for run in mine:
                     counts[run['outcome']] = counts.get(run['outcome'], 0) + 1
                 tokens = sorted(run.get('output_tokens') or 0 for run in mine)
-                print(f'{name} / {task}: {counts}; output tokens {tokens}', flush=True)
+                minus = sum(run.get('face_minus', 0) for run in mine)
+                print(f'{name} / {task}: {counts}; output tokens {tokens}'
+                      + (f'; face lines with "-": {minus}' if task == 'obj' else ''), flush=True)
                 for run in mine:
                     for item in run.get('stray', [])[:2]:
                         print(f'   stray {item["char"]}: {item["context"]!r}')
