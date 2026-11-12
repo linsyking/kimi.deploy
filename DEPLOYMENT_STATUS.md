@@ -3,11 +3,12 @@
 Kimi K3.1 Pro, TP16 · DCP16 across c04 (rank 0), c11, c13 and c14, on
 http://10.78.202.32:30000/v1 (model `kimi-k3.1-pro`). Stage 3 (DFLASH, 8 draft tokens, radix
 prefix cache without HiCache) plus the Anthropic web search and thinking budget ported from
-ds.deploy, with pqhaz's abliteration overlay and a 1,046,528-token context. Since 03:54 UTC on
-2026-11-12 (19:54 PST on 11-11) it runs SGLang 7422c70f with the model's sampling defaults
-(temperature 1.0, top_p 0.95). It is published through frp on remote port 8313. Every item of the
-brief's validation checklist passes for all stages. The abliteration overlay is what corrupts long
-structured output in Claude Code ("Claude Code mess" below); `./modelctl official` removes it.
+ds.deploy, with the official weights and a 1,046,528-token context. It runs SGLang 7422c70f with the
+model's sampling defaults (temperature 1.0, top_p 0.95). The current server has run since 04:19 UTC
+on 2026-11-12 (20:19 PST on 11-11), and is published through frp on remote port 8313. Every item of
+the brief's validation checklist passes for all stages. pqhaz's abliteration overlay served from
+2026-11-11 08:36 UTC until it was found to corrupt long structured output in Claude Code ("Claude
+Code mess" below); `./modelctl abliterated` brings it back.
 
 | Stage | State |
 |---|---|
@@ -18,7 +19,7 @@ structured output in Claude Code ("Claude Code mess" below); `./modelctl officia
 | 2. DFLASH | serving; functional checks, stress test and bench sweeps pass |
 | 3. Prefix cache | serving with the radix cache; HiCache tried and dropped at the user's decision |
 | Anthropic extras | web search (Exa), thinking budget and a medium-effort mapping; all checks pass |
-| Abliteration overlay | serving since 08:36 UTC on 2026-11-11: pqhaz's patch as a 278-tensor overlay, loaded on all 16 ranks |
+| Abliteration overlay | served 2026-11-11 08:36 UTC to 2026-11-12 04:13 UTC: pqhaz's patch as a 278-tensor overlay; official weights since |
 | Engine upgrade | 7422c70f (branch head) serving since 2026-11-12; 8b180ca9 kept for rollback |
 | Claude Code mess | reproduced; caused by the abliteration overlay, measured against the official weights |
 
@@ -517,7 +518,7 @@ in Claude Code sessions, worst in long outputs such as an SVG or a 3D model. The
 | SVG well-formed, T=0 | 6/6 | 6/6 |
 | Edit old_string miscopied of 48: T=1 top_p=1 / client default / T=0 | 1 / 3 / 0 | 1 / 3 / 1 |
 | Claude Code sessions with a failed tool call | 0/4 | 0/4 |
-| `anthropic_check.py --only budget` runs passed | not run | 3/5 |
+| `anthropic_check.py --only budget` runs passed | 3/5 | 3/5 |
 
 - long_output_check.py: 6 trials per condition, effort low. Each trial is a Write tool call of an OBJ
   sphere (362 vertices, faces with 1-based indices) or of an SVG.
@@ -542,10 +543,14 @@ in Claude Code sessions, worst in long outputs such as an SVG or a 3D model. The
   reads; it is not specific to the overlay.
 - claude_code_trace.py: 4 Claude Code sessions on a fixture project (rename, a bug fix, CJK comments, a
   new flag). Neither variant failed a call in 4 sessions of 4–6 requests each.
-- budget: the reasoning is cut at the budget every time. In 5 of 20 budgeted answers, though, the
-  abliterated model kept reasoning in the visible answer ("Need not hallucinate. Let's systematically
-  derive.") until max_tokens. 3 of 5 runs at 04:02–04:04 UTC passed, as did the one at 03:00 UTC on the
-  same configuration. Claude Code sends no numeric budget to this model.
+- budget: both weights cut the reasoning at the budget every time. On the check's sudoku, though, the
+  model often has not solved it by the cut. It then keeps reasoning in the visible answer ("Need not
+  hallucinate. Let's systematically derive.", "Wait let's carefully calculate!") until max_tokens.
+  This happened in 5 of 20 budgeted answers with the abliterated weights (04:02–04:04 UTC) and 4 of 20
+  with the official ones (04:21–04:23 UTC). Once the official model even wrote tool-call markup
+  (`<|open|>argument key="analysis"`) with no tools offered. This is the model under a forced cut, not
+  either variant's flaw, and it makes the check flaky. Claude Code sends no numeric budget to this
+  model.
 
 **What it is not.**
 
@@ -613,6 +618,13 @@ Each took about 6 minutes to become ready. The tunnel was open from 03:00:43 to 
 04:05:05 UTC, after `smoke_test.py` and `anthropic_check.py` passed on the final configuration (budget
 as above), with no errors in any node's log.
 
+**Switched to the official weights** at the user's request, with `./modelctl official` at 04:13 UTC:
+- The tunnel closed first. The graceful stop drained 0 requests, and every GPU came back to 4–13 MiB.
+- The server was ready after 352 s and `modelctl status` reports official on all ranks.
+- `smoke_test.py` passes. `anthropic_check.py` passes except its flaky budget check (above).
+- Decode runs at 181 tok/s median. No node logs an error.
+- The tunnel reopened at 04:23:31 UTC (20:23:31 PST), so public access was down for 10 minutes.
+
 ## Public access (frp)
 
 `kimictl tunnel start` at 19:55 UTC, once stage 2 passed its checks: config check (exactly the
@@ -642,9 +654,11 @@ in `/scratch_local/user_data/kimi-k3.1-pro-endpoint.txt`, mode 0644, readable by
 
 ## Next
 
-- The service runs the abliterated overlay. It breaks long structured output: OBJ 0/18 valid against
-  16/18 with the official weights, SVG 13/18 against 18/18 ("Claude Code mess"). Keeping it or
-  switching with `./modelctl official` is the user's decision. Its DFLASH acceptance is unmeasured.
+- The service runs the official weights since 2026-11-12, at the user's request. The abliterated overlay
+  breaks long structured output: OBJ 0/18 valid against 16/18, SVG 13/18 against 18/18 ("Claude Code
+  mess"). `./modelctl abliterated` brings it back; its DFLASH acceptance is unmeasured.
+- The budget check in `anthropic_check.py` is flaky (3/5 runs pass with either weights): its sudoku is
+  often unsolved at a 1,024- or 2,048-token cut. An easier task would test the mechanism alone.
 - Block verification stays on (the draft README) although the NVIDIA recipes leave it out;
   `speculative.block_verification: false` and a restart would match them.
 - `/dev/shm` on c04 holds rank 0's leftover queue and semaphore files from the stopped runs, 129 files

@@ -10,8 +10,8 @@ protected by the key in `.secrets/api-key`. Tunable values are in `serving.json`
 - Serving: DFLASH x8, 32 running requests, radix prefix cache on (stage 3), no HiCache
 - Engine: SGLang `kimi-k3.1-day-0` @ 7422c70f50bc in `.venvs/sglang-7422c70f`, from source in a uv venv
   (no containers); the first build, 8b180ca9e07e in `.venvs/sglang`, is kept for rollback
-- Weights: official shards plus pqhaz's abliteration overlay, active since 2026-11-11 (see Weights);
-  it corrupts long structured output such as OBJ and SVG files
+- Weights: official, since 2026-11-12. pqhaz's abliteration overlay (served 2026-11-11) corrupts long
+  structured output such as OBJ and SVG files; `./modelctl abliterated` brings it back (see Weights)
 
 Current state and measurements are in DEPLOYMENT_STATUS.md.
 
@@ -263,4 +263,4 @@ Same build and flags, with only the weights switched, written through a Write to
 
 It is worst at T=1 but present at T=0, so sampling does not explain it. Short edits and Claude Code
 sessions on a small project were the same with either weights. For coding agents that write long
-files, use `./modelctl official`.
+files, use the official weights; the service has run them since 2026-11-12.
