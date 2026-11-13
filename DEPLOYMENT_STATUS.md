@@ -1,12 +1,12 @@
-# Deployment status — 2026-11-12
+# Deployment status — 2026-11-13
 
 Kimi K3.1 Pro, TP16 · DCP16 across c04 (rank 0), c11, c13 and c14, on
 http://10.78.202.32:30000/v1 (model `kimi-k3.1-pro`). Stage 3 (DFLASH, 8 draft tokens, radix
 prefix cache without HiCache) plus the Anthropic web search and thinking budget ported from
 ds.deploy, with the official weights and a 1,046,528-token context. It runs SGLang 7422c70f with the
 model's sampling defaults (temperature 1.0, top_p 0.95), plus Anthropic PDF and text documents. The
-current server has run since 17:08 UTC on 2026-11-12 (09:08 PST), and is published through frp on
-remote port 8313. Every item of
+current server has run since 21:09 UTC on 2026-11-13 (13:09 PST), after the hang below, and is
+published through frp on remote port 8313. Every item of
 the brief's validation checklist passes for all stages. pqhaz's abliteration overlay served from
 2026-11-11 08:36 UTC until it was found to corrupt long structured output in Claude Code ("Claude
 Code mess" below); `./modelctl abliterated` brings it back.
@@ -715,6 +715,34 @@ Restart: the stop began at about 17:02 UTC (09:02 PST) and drained 0 requests; e
 3–7 MiB. The server was ready after 341 s. The tunnel reopened at 17:11:51 UTC (09:11:51 PST) after the
 checks above, so public access was down for about 10 minutes.
 
+## Hang and watchdog abort (2026-11-13, 11:23–11:34 PST)
+
+Nobody stopped the server; it hung, and NCCL's watchdog killed it. At 11:23:43 PST (19:23 UTC) a Claude
+Code request came through the tunnel with a prompt of about 390K tokens and 0 cached tokens; the
+requests just before it had reused about 389K cached tokens. Six 16,384-token prefill chunks ran
+(11:23:44–11:23:48), then nothing progressed. Two later requests (11:27:44, 11:31:50) were accepted but
+never ran. At 11:33:48, after 600 s, the watchdog on all 16 ranks flagged the DCP all-gather
+(SeqNum 173471, 946,176 → 15,138,816 elements) and a one-element TP all-reduce (SeqNum 8360). At
+11:34:48–50 every rank aborted (SIGABRT, exit −6), and rank 0 cleaned up at 11:34:54.
+
+- Every rank had queued the same collectives (DCP through 173474, TP through 8361), and none had
+  completed 173471 or 8360. So no rank fell behind or skipped one on the CPU side: the hang is on
+  the GPUs, inside NCCL or in a kernel queued before it.
+- All 16 main threads waited in the same place: flashinfer's KDA chunked prefill
+  (`_cu_seqlens_contents`, `cu_seqlens.cpu().tolist()`, line 6291 of `kda_chunked_bt16.py`), a host
+  sync behind those collectives.
+- A prompt of the same size prefilled normally one minute earlier (11:22:41–11:22:45), so the size
+  alone does not trigger it.
+- The logs show no NCCL network or CUDA errors near the hang. Kernel logs (Xid) need root.
+  No node rebooted (all up since 2026-11-09), and no flight-recorder dump was written.
+- Why the collectives never completed is unknown. One unconfirmed possibility: the two process
+  groups' collectives, both in flight at once, deadlocked each other.
+
+Every GPU came back to 0–1 MiB with recovery None. The tunnel stayed up against the dead server until
+it was stopped at about 13:03 PST. `./kimictl start` at 13:03:24 PST was ready after 351 s with
+the official weights. `smoke_test.py` passed (`.runs/smoke/20261113-130943.json`, including the 128K
+needle). The crashed run's log is `logs/sglang-20261113-13032*.log` on each node.
+
 ## Public access (frp)
 
 `kimictl tunnel start` at 19:55 UTC, once stage 2 passed its checks: config check (exactly the
@@ -742,11 +770,18 @@ final server: `login to server success`, `[kimi-c04-30000-to-8313] start proxy s
 The restart that enabled documents closed it at about 17:02 UTC on 2026-11-12. It reopened at 17:11:51
 UTC (09:11:51 PST): `start proxy success`.
 
+The hang on 2026-11-13 left it running against the dead server; frpc logged `connection refused` for
+retrying clients. It was stopped at about 13:03 PST and reopened at 13:09:49 PST (21:09:49 UTC), after
+the smoke test: `start proxy success`.
+
 At the user's request the API key and the endpoint URL, and nothing else (no frp details), are
 in `/scratch_local/user_data/kimi-k3.1-pro-endpoint.txt`, mode 0644, readable by every user on c04.
 
 ## Next
 
+- The 2026-11-13 hang ("Hang and watchdog abort") is undiagnosed. If it recurs, the NCCL flight recorder
+  (`TORCH_NCCL_TRACE_BUFFER_SIZE`) would show which rank stalled first. A replay of an uncached ~390K
+  prompt may reproduce it.
 - The service runs the official weights since 2026-11-12, at the user's request. The abliterated overlay
   breaks long structured output: OBJ 0/18 valid against 16/18, SVG 13/18 against 18/18 ("Claude Code
   mess"). `./modelctl abliterated` brings it back; its DFLASH acceptance is unmeasured.
