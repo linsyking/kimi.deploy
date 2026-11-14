@@ -761,7 +761,7 @@ State afterwards (read-only checks):
   rebooted, and only this account was logged in.
 - `kimictl start` refuses (its preflight requires recovery None). A GPU reset or reboot is an
   administrator's action. Nothing was retried.
-- The tunnel was left running against the stopped server.
+- The tunnel stayed up against the stopped server until the user had it stopped at 22:13 PST.
 
 All four trays failed in the same second, so this was a failure of the shared NVLink fabric, not of
 one GPU. Without the Xid it is unknown whether a link or switch failed, or a bad remote access
