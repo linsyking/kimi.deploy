@@ -5,8 +5,9 @@ http://10.78.202.32:30000/v1 (model `kimi-k3.1-pro`). Stage 3 (DFLASH, 8 draft t
 prefix cache without HiCache) plus the Anthropic web search and thinking budget ported from
 ds.deploy, with the official weights and a 1,046,528-token context. It runs SGLang 7422c70f with the
 model's sampling defaults (temperature 1.0, top_p 0.95), plus Anthropic PDF and text documents. The
-current server has run since 21:09 UTC on 2026-11-13 (13:09 PST), after the hang below, and is
-published through frp on remote port 8313. Every item of
+server ran from 21:09 UTC on 2026-11-13 (13:09 PST) until 20:05:37 PST (04:05 UTC on 2026-11-14), when an
+uncorrectable NVLink error stopped it and left every GPU needing a reset ("Uncorrectable NVLink
+error" below). It cannot start again until an administrator resets the GPUs. Every item of
 the brief's validation checklist passes for all stages. pqhaz's abliteration overlay served from
 2026-11-11 08:36 UTC until it was found to corrupt long structured output in Claude Code ("Claude
 Code mess" below); `./modelctl abliterated` brings it back.
@@ -743,6 +744,34 @@ it was stopped at about 13:03 PST. `./kimictl start` at 13:03:24 PST was ready a
 the official weights. `smoke_test.py` passed (`.runs/smoke/20261113-130943.json`, including the 128K
 needle). The crashed run's log is `logs/sglang-20261113-13032*.log` on each node.
 
+## Uncorrectable NVLink error (2026-11-13, 20:05 PST)
+
+At 20:05:36 PST a Claude Code request came through the tunnel. Within a second every rank's scheduler
+failed in the KDA prefill with `CUDA_ERROR_NVLINK_UNCORRECTABLE` (220), from `cuMemcpyDtoHAsync`
+at the same `cu_seqlens.cpu()` line as the 11:23 hang. c04 (TP2), c13 (TP9) and c14 (TP12) failed at
+20:05:37, and c11 at 20:05:38. The NCCL watchdogs then aborted every process, and rank 0 cleaned up
+at 20:05:43. The request before it (20:04:33, 4,670 new tokens on 328,704 cached) completed normally.
+
+State afterwards (read-only checks):
+
+- All 16 GPUs report `GPU Recovery Action: Reset`, and `nvidia-smi nvlink` reports "all links are
+  inActive" on every GPU. The fabric registration still reads Completed / Success / Healthy, and
+  memory is 0–1 MiB with no processes. ECC and remapped rows show no errors.
+- The kernel log, which would give the Xid and the failing link or switch, needs root. No node
+  rebooted, and only this account was logged in.
+- `kimictl start` refuses (its preflight requires recovery None). A GPU reset or reboot is an
+  administrator's action. Nothing was retried.
+- The tunnel was left running against the stopped server.
+
+All four trays failed in the same second, so this was a failure of the shared NVLink fabric, not of
+one GPU. Without the Xid it is unknown whether a link or switch failed, or a bad remote access
+caused it. The 11:23 hang stopped at the same host sync while NVLink collectives were outstanding.
+That fits the same fault surfacing earlier as a hang instead of an error, but it is not confirmed.
+
+Unrelated to the failure: c04's log has 11 caching-allocator OOM warnings on GPU 0 since 13:16 (up
+to 1.17 GB requested with 0.26–0.71 GB free). They were retried without an error, so memory headroom
+on rank 0 is thin.
+
 ## Public access (frp)
 
 `kimictl tunnel start` at 19:55 UTC, once stage 2 passed its checks: config check (exactly the
@@ -779,6 +808,9 @@ in `/scratch_local/user_data/kimi-k3.1-pro-endpoint.txt`, mode 0644, readable by
 
 ## Next
 
+- Every GPU needs an administrator reset after the 2026-11-13 20:05 PST NVLink error (see "Uncorrectable NVLink
+  error"). Ask them for the Xid and the failing link or switch, and whether other trays on this
+  NVLink domain were affected.
 - The 2026-11-13 hang ("Hang and watchdog abort") is undiagnosed. If it recurs, the NCCL flight recorder
   (`TORCH_NCCL_TRACE_BUFFER_SIZE`) would show which rank stalled first. A replay of an uncached ~390K
   prompt may reproduce it.
