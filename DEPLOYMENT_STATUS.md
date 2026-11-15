@@ -8,7 +8,7 @@ model's sampling defaults (temperature 1.0, top_p 0.95), plus Anthropic PDF and 
 server ran from 21:09 UTC on 2026-11-13 (13:09 PST) until 20:05:37 PST (04:05 UTC on 2026-11-14), when an
 uncorrectable NVLink error stopped it and left every GPU needing a reset ("Uncorrectable NVLink
 error" below). After the nodes were rebooted on 2026-11-14, the current server has run since 19:19 PST
-(03:19 UTC on 2026-11-15). The tunnel is stopped at the user's request. Every item of
+(03:19 UTC on 2026-11-15), and is published through frp on remote port 8313 again since 19:20 PST. Every item of
 the brief's validation checklist passes for all stages. pqhaz's abliteration overlay served from
 2026-11-11 08:36 UTC until it was found to corrupt long structured output in Claude Code ("Claude
 Code mess" below); `./modelctl abliterated` brings it back.
@@ -779,7 +779,8 @@ links active and 0 uncorrected ECC errors. Preflight's only finding was `DEPLOYM
 on the workers, from documentation commits after the last start. `./kimictl start` at about 19:13 PST
 was ready after 351 s with the official weights. `smoke_test.py` passed
 (`.runs/smoke/20261114-191937.json`, including the 128K needle). The new log has no NVLink, CUDA or
-watchdog errors. The tunnel was left stopped.
+watchdog errors. At the user's request the tunnel reopened at 19:20:25 PST, after `tunnel start`'s
+checks (401 without the key, 401 for an admin endpoint with the API key): `start proxy success`.
 
 ## Public access (frp)
 
