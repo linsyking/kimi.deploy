@@ -7,7 +7,8 @@ ds.deploy, with the official weights and a 1,046,528-token context. It runs SGLa
 model's sampling defaults (temperature 1.0, top_p 0.95), plus Anthropic PDF and text documents. The
 server ran from 21:09 UTC on 2026-11-13 (13:09 PST) until 20:05:37 PST (04:05 UTC on 2026-11-14), when an
 uncorrectable NVLink error stopped it and left every GPU needing a reset ("Uncorrectable NVLink
-error" below). It cannot start again until an administrator resets the GPUs. Every item of
+error" below). After the nodes were rebooted on 2026-11-14, the current server has run since 19:19 PST
+(03:19 UTC on 2026-11-15). The tunnel is stopped at the user's request. Every item of
 the brief's validation checklist passes for all stages. pqhaz's abliteration overlay served from
 2026-11-11 08:36 UTC until it was found to corrupt long structured output in Claude Code ("Claude
 Code mess" below); `./modelctl abliterated` brings it back.
@@ -772,6 +773,14 @@ Unrelated to the failure: c04's log has 11 caching-allocator OOM warnings on GPU
 to 1.17 GB requested with 0.26–0.71 GB free). They were retried without an error, so memory headroom
 on rank 0 is thin.
 
+Recovery: c04, c11, c13 and c14 were rebooted between 15:27 and 15:49 PST on 2026-11-14 (not by this
+account). At 19:12 PST every GPU read recovery None, fabric Completed / Success / Healthy, 18 of 18 NVLink
+links active and 0 uncorrected ECC errors. Preflight's only finding was `DEPLOYMENT_STATUS.md` differing
+on the workers, from documentation commits after the last start. `./kimictl start` at about 19:13 PST
+was ready after 351 s with the official weights. `smoke_test.py` passed
+(`.runs/smoke/20261114-191937.json`, including the 128K needle). The new log has no NVLink, CUDA or
+watchdog errors. The tunnel was left stopped.
+
 ## Public access (frp)
 
 `kimictl tunnel start` at 19:55 UTC, once stage 2 passed its checks: config check (exactly the
@@ -808,9 +817,8 @@ in `/scratch_local/user_data/kimi-k3.1-pro-endpoint.txt`, mode 0644, readable by
 
 ## Next
 
-- Every GPU needs an administrator reset after the 2026-11-13 20:05 PST NVLink error (see "Uncorrectable NVLink
-  error"). Ask them for the Xid and the failing link or switch, and whether other trays on this
-  NVLink domain were affected.
+- The 2026-11-13 20:05 PST NVLink error was cleared by the reboot on 2026-11-14; its cause (Xid, link or
+  switch) is still unknown to this account. Ask the administrator, and watch for a repeat.
 - The 2026-11-13 hang ("Hang and watchdog abort") is undiagnosed. If it recurs, the NCCL flight recorder
   (`TORCH_NCCL_TRACE_BUFFER_SIZE`) would show which rank stalled first. A replay of an uncached ~390K
   prompt may reproduce it.
