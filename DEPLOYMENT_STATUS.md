@@ -782,6 +782,20 @@ was ready after 351 s with the official weights. `smoke_test.py` passed
 watchdog errors. At the user's request the tunnel reopened at 19:20:25 PST, after `tunnel start`'s
 checks (401 without the key, 401 for an admin endpoint with the API key): `start proxy success`.
 
+Speed after the reboot (22:01–22:06 PST, no outside traffic during the benchmark). One request at a time
+through `/v1/messages` (`anthropic_check.py --only speed`): 175.2 tok/s median (164–201 over 8 runs).
+`bench.sh post-reboot-20261114` (random 8K in / 1K out; the repetitive text inflates acceptance):
+
+| Concurrency | Requests | TTFT mean / p90 (ms) | TPOT mean / p90 (ms) | ITL p90 (ms) | Output tok/s | Total tok/s | Accept length |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 8 | 364 / 379 | 1.9 / 2.1 | 2.0 | 439 | 3,952 | 7.43 |
+| 8 | 32 | 1,323 / 2,122 | 4.7 / 6.6 | 4.3 | 1,212 | 10,907 | 7.23 |
+| 32 | 128 | 4,356 / 7,568 | 10.8 / 13.6 | 5.5 | 2,027 | 18,247 | 7.58 |
+| 64 | 256 | 17,735 / 22,442 | 11.4 / 13.7 | 6.0 | 2,027 | 18,244 | 7.59 |
+
+Within 2% of stage 2's table. Live Claude Code traffic since the restart averaged 2.94 accepted tokens per
+verify step (718 single-request decode log lines).
+
 ## Public access (frp)
 
 `kimictl tunnel start` at 19:55 UTC, once stage 2 passed its checks: config check (exactly the
