@@ -105,11 +105,33 @@ values a request sends still win. `reasoning_effort` takes
 to `max`. The effort is a prompt instruction to the model, not a token limit. The engine branch
 passes `medium` through as a K3.1 tier that this checkpoint's encoder (`encoding_k3.py`) rejects
 (HTTP 500), so `serving.json`'s `medium_effort_as: "high"` maps it in the API process, as SGLang
-does for K3. `max_tokens` (or `max_completion_tokens`) caps reasoning and answer together, exactly;
+does for K3.
+
+`max_tokens` (or `max_completion_tokens`) caps reasoning and answer together, exactly;
 a small cap can end inside the reasoning with no answer. The context limit of 1,046,528 tokens
 includes `max_tokens`. Reasoning and tool calls use the `kimi_k3` parsers; in
 multi-turn use send back the full assistant message, including `reasoning_content` and
 `tool_calls`. Images are accepted as input.
+
+### Thinking-effort prompt
+
+With thinking on, the encoder renders an internal `type="thinking-effort"` system message before
+the request's own system prompt. A request can replace that whole message, with no restart:
+
+- OpenAI `/v1/chat/completions`: `"chat_template_kwargs": {"thinking_effort_prompt": "..."}`
+- Anthropic `/v1/messages` and `/v1/messages/count_tokens`: a top-level `"thinking_effort_prompt": "..."`
+  (SDKs: `extra_body`)
+- Either route: the header `X-Thinking-Effort-Prompt`, percent-encoded UTF-8 (`%0A` for a newline;
+  plain ASCII without `%` needs no encoding). Claude Code can send it through
+  `ANTHROPIC_CUSTOM_HEADERS`. A body value wins over the header.
+
+`{effort}` expands to the tier the encoder renders (`low`, `high` or `max`); `medium` arrives as
+`high` and an omitted effort as `max`. A string without the placeholder is used for every tier. The
+text is encoded as plain text, so special-token strings in it cannot add control tokens. A value
+that is not a non-empty string is a 400; `null` or no value keeps the stock message byte for byte.
+Thinking-disabled requests render no effort message, so the override has no effect there, and
+`thinking.budget_tokens` enforcement is unchanged. Requests with different effort prompts don't
+share radix-cache prefixes.
 
 ## Anthropic API and Claude Code
 
@@ -121,16 +143,22 @@ with `output_config.effort` (`high` by default); `CLAUDE_CODE_MAX_OUTPUT_TOKENS`
 `max_tokens`, and `MAX_THINKING_TOKENS` sends no numeric budget for this model. Sessions longer
 than the 1,046,528-token context minus `max_tokens` get HTTP 400.
 
-Web search (`enable_web_search`): `web_search.py`, ported from ds.deploy, is an ASGI middleware on
-rank 0. A `/v1/messages` request that declares Anthropic's server tool (`web_search` or
-`web_search_YYYYMMDD`, as Claude Code's WebSearch sends) gets one Exa search (auto, 5 results) on
-the last user text or Claude Code's "for the query:" text; the excerpts are appended to that user
-turn as evidence and the server tool is removed before inference. Identical queries are cached for
-ten minutes; a failed search returns HTTP 502 rather than an unsearched answer. `allowed_domains`
-or `blocked_domains` become Exa filters (not both). No Anthropic server-tool events, citation
-blocks or multi-search loops. Requests without the server tool pass through byte for byte. The
-Exa key is `.secrets/exa-api-key` (mode 0600, the same key ds.deploy uses); rank 0 reads it at
-launch, it is not put in the environment, synced or logged.
+Web search (`enable_web_search`): `web_search.py` is an ASGI middleware on rank 0 backed by the
+OpenSERP service configured by `openserp_base_url` in `serving.json`. A `/v1/messages` request that
+declares Anthropic's server tool (`web_search` or `web_search_YYYYMMDD`, as Claude Code's WebSearch
+sends) derives one query from the last user text or Claude Code's "for the query:" text. The adapter
+tries `openserp_engines` in order (DuckDuckGo, Bing, then Yandex by default), moving to the next on a
+provider error or no usable results. It requests ten organic results and returns up to five after
+filtering. The snippets are appended to that user turn as evidence and the server tool is removed
+before inference. Identical queries are cached for ten minutes; total failure returns HTTP 502 rather
+than an unsearched answer. Each engine has a 10-second timeout, with a 24-second overall deadline.
+
+`allowed_domains` or `blocked_domains` (not both) are enforced by the adapter on result hostnames;
+OpenSERP's `site:` behavior is not relied on. Only direct HTTP(S) result URLs are accepted, and the
+provider client does not follow redirects. No Anthropic server-tool events, citation blocks or
+multi-search loops. Requests without the server tool pass through byte for byte. The OpenSERP key is
+`.secrets/openserp-api-key` (mode 0600); rank 0 reads it at launch, and it is not put in the
+environment, synced or logged. The old `.secrets/exa-api-key` is unused.
 
 Thinking budget (`enforce_thinking_budget`): `thinking_budget.py`, ported from ds.deploy, maps an
 Anthropic `thinking.budget_tokens` (1024 or more) onto SGLang's strict-thinking grammar, which
@@ -177,7 +205,7 @@ Rendering and limits:
   URL downloads are bounded in size and time.
 
 kimictl installs it before `web_search.py`. Starlette puts the last-added middleware outermost, so web
-search sees the original user text and page text never becomes an Exa query. Keep that order.
+search sees the original user text and page text never becomes an OpenSERP query. Keep that order.
 `count_tokens` keeps SGLang's estimate, which undercounts images; the `usage.input_tokens` of a
 generation is exact.
 
@@ -189,7 +217,7 @@ it, and a venv built earlier gets it with:
 
 Tests:
 
-    CUDA_VISIBLE_DEVICES='' .venvs/<venv>/bin/python -m unittest test_documents.py test_web_search.py
+    CUDA_VISIBLE_DEVICES='' .venvs/<venv>/bin/python -m unittest test_documents.py test_web_search.py test_anthropic_check.py test_effort_prompt.py
     CUDA_VISIBLE_DEVICES='' .venvs/<venv>/bin/python -m unittest test_documents_native.py  # installed SGLang
     .venvs/<venv>/bin/python check_documents.py      # live: JSON, SSE, Read results, errors, search, page cost
     .venvs/<venv>/bin/python anthropic_check.py --only documents

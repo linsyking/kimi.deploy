@@ -1,14 +1,14 @@
-# Deployment status — 2026-11-13
+# Deployment status — 2026-11-17
 
 Kimi K3.1 Pro, TP16 · DCP16 across c04 (rank 0), c11, c13 and c14, on
 http://10.78.202.32:30000/v1 (model `kimi-k3.1-pro`). Stage 3 (DFLASH, 8 draft tokens, radix
-prefix cache without HiCache) plus the Anthropic web search and thinking budget ported from
-ds.deploy, with the official weights and a 1,046,528-token context. It runs SGLang 7422c70f with the
+prefix cache without HiCache) plus Anthropic web search and thinking budget, with OpenSERP replacing
+Exa on 2026-11-17, official weights and a 1,046,528-token context. It runs SGLang 7422c70f with the
 model's sampling defaults (temperature 1.0, top_p 0.95), plus Anthropic PDF and text documents. The
 server ran from 21:09 UTC on 2026-11-13 (13:09 PST) until 20:05:37 PST (04:05 UTC on 2026-11-14), when an
 uncorrectable NVLink error stopped it and left every GPU needing a reset ("Uncorrectable NVLink
-error" below). After the nodes were rebooted on 2026-11-14, the current server has run since 19:19 PST
-(03:19 UTC on 2026-11-15), and is published through frp on remote port 8313 again since 19:20 PST. Every item of
+error" below). After the nodes were rebooted on 2026-11-14, the server was restarted with OpenSERP on 2026-11-17
+and is published through frp on remote port 8313. Every item of
 the brief's validation checklist passes for all stages. pqhaz's abliteration overlay served from
 2026-11-11 08:36 UTC until it was found to corrupt long structured output in Claude Code ("Claude
 Code mess" below); `./modelctl abliterated` brings it back.
@@ -21,11 +21,73 @@ Code mess" below); `./modelctl abliterated` brings it back.
 | 1. Baseline launch | serving; functional checks, stress test and bench sweep pass |
 | 2. DFLASH | serving; functional checks, stress test and bench sweeps pass |
 | 3. Prefix cache | serving with the radix cache; HiCache tried and dropped at the user's decision |
-| Anthropic extras | web search (Exa), thinking budget and a medium-effort mapping; all checks pass |
+| Anthropic extras | web search (OpenSERP: DuckDuckGo, Bing, Yandex), thinking budget and a medium-effort mapping; all checks pass |
 | Abliteration overlay | served 2026-11-11 08:36 UTC to 2026-11-12 04:13 UTC: pqhaz's patch as a 278-tensor overlay; official weights since |
 | Engine upgrade | 7422c70f (branch head) serving since 2026-11-12; 8b180ca9 kept for rollback |
 | Claude Code mess | reproduced; caused by the abliteration overlay, measured against the official weights |
 | PDF and text documents | ported from ds.deploy `bed126d`; serving since 2026-11-12 17:08 UTC; all checks pass |
+
+## OpenSERP replaces Exa (2026-11-17)
+
+The Anthropic web-search middleware now uses the authenticated OpenSERP service at
+`https://dsh.linsyking.com`; SGLang's private Exa client is no longer used. `serving.json` sets
+`search_provider: openserp` and `openserp_engines: [duckduckgo, bing, yandex]`. The adapter uses
+single-engine `/mega/search` requests in that order, falling back on provider errors or no usable
+results. It requests ten organic results, returns up to five after domain filtering, enforces
+`allowed_domains`/`blocked_domains` locally, accepts only direct HTTP(S) URLs and does not follow
+redirects. Each engine has a 10-second timeout with a 24-second overall deadline. The ten-minute
+cache, request coalescing and document-before-search middleware order are unchanged.
+`.secrets/openserp-api-key` is mode 0600, read only on rank 0 and never synced, put in the
+environment or logged; the old Exa key is unused.
+
+Provider measurements on 2026-11-17 (eight-query suites): DuckDuckGo median 3.30 seconds through
+megasearch and 3.34 seconds dedicated, mega-Bing 4.79 seconds, Yandex 5.98 seconds. Mega-Bing kept
+the same top result as full multi-engine Bing on all eight queries and was best for official news.
+DuckDuckGo was faster on all eight paired queries and had fuller snippets. Yandex was strongest for
+some technical details. Baidu and Ecosia returned provider errors and are not enabled; Google is not
+in the configured chain.
+
+Validation: the initial 42 web-search/document unit tests, four engine-patch tests and native
+document test passed. Independent review then added a full request-I/O deadline, a provider-attempt
+log marker and strict hostname validation in the live citation check. The expanded final suite of
+52 tests passed, including a slow-response deadline case and domain-lookalike citations. Two direct
+adapter checks against the live OpenSERP service passed, including allow-domain filtering. The
+graceful restart released every GPU (2-6 MiB on all 16), then became ready after 351 seconds with
+official weights. Live `smoke_test.py`, `anthropic_check.py --only
+search no-search`, `claude_code_check.py --only search` and all eight `check_documents.py` cases
+passed, including streaming search and search with a PDF. The log shows DuckDuckGo serving the
+requests and no provider or engine errors. The frp tunnel is running with `start proxy success`.
+
+## Per-request thinking-effort prompt (2026-11-18)
+
+Kimi's template puts an internal `thinking-effort` system message (the stock text "`thinking_effort`
+guides on how much to think ... Now the system is invoked with `thinking_effort=<tier>`.") before the
+user's system prompt whenever thinking is on. A request can now replace it, with no restart. It does
+so through OpenAI `chat_template_kwargs.thinking_effort_prompt`, an Anthropic top-level
+`thinking_effort_prompt`, or the percent-encoded `X-Thinking-Effort-Prompt` header (README,
+"Thinking-effort prompt"). `{effort}` becomes the rendered tier (low, high or max). A first version
+read the prompt from `serving.json` at launch. It was replaced by the per-request override, and
+`kimictl` now rejects that key. `effort_prompt.py` carries the value in the request's own
+`chat_template_kwargs` and patches the tokenizer's dynamic `encoding_k3` module once the chat
+adapter is constructed. Eight tests render the real tokenizer and drive the real request
+converters. The six main test files (60 tests) pass, and `test_thinking_budget.py` and
+`test_checkpoint_overlay.py` pass on their own. Run in one process together with
+`test_documents_native.py`, the thinking-budget test's global fake converter breaks the documents
+test.
+
+Two restarts on 2026-11-18, the first with the launch-time option and the second with the
+per-request override. Each graceful stop released every GPU (2-8 MiB on all 16), and the server was
+ready after 361 and 351 seconds with official weights.
+
+Live checks after the second restart:
+- Every override path changed the prompt by the 12 tokens the local tokenizer predicts: OpenAI body
+  and header, Anthropic body and header, and `count_tokens` body and header.
+- Blank and non-string values returned 400 on OpenAI, on Anthropic, and on Anthropic streaming.
+- A codeword put in the override was read back by the model; without it the model answered NONE.
+- Requests without an override kept their token counts; no-search stayed at 161 input tokens.
+- `smoke_test.py` and `anthropic_check.py --only effort search no-search budget` passed.
+
+The frp tunnel was reopened at 10:58 PST with `start proxy success`.
 
 ## Pre-flight (2026-11-10 17:54 UTC)
 

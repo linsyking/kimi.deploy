@@ -1,9 +1,9 @@
-"""Basic Anthropic search compatibility using SGLang's native Exa client.
+"""Anthropic search compatibility backed by an OpenSERP HTTP service.
 
-Ported from ds.deploy. One Exa query is derived from the last user text, then its
-evidence is supplied to the model. It does not implement Anthropic's server-tool
-events or dynamic filtering. kimictl installs it on rank 0, the node that runs the
-HTTP server; the SGLang package is not modified.
+One query is derived from the last user text. DuckDuckGo, Bing and Yandex are
+tried in order until one returns usable results; its evidence is supplied to the
+model. This does not implement Anthropic's server-tool events or dynamic filtering.
+kimictl installs it on rank 0; the SGLang package is not modified.
 """
 import asyncio
 from collections import OrderedDict
@@ -12,34 +12,92 @@ import json
 import logging
 import re
 import time
+from urllib.parse import urlsplit
 
 LOGGER = logging.getLogger(__name__)
 SERVER_TOOL = re.compile(r'^web_search(?:_\d{8})?$')
 QUERY = re.compile(r'for the query:\s*(.+)', re.IGNORECASE | re.DOTALL)
+DEFAULT_ENGINES = ('duckduckgo', 'bing', 'yandex')
 
 
 class SearchRequestError(ValueError):
     pass
 
 
-class ExaSearch:
-    """Reuse the installed SGLang Exa transport and its connection lifecycle."""
-    def __init__(self, api_key):
-        from sglang.srt.entrypoints.search.exa_client import ExaClient, ExaSearchConfig
-        self.client = ExaClient(api_key, config=ExaSearchConfig(
-            num_results=5, search_type='auto', include_highlights=True), timeout=15)
+def result_domain(url):
+    try:
+        parsed = urlsplit(url)
+        if parsed.scheme not in ('http', 'https') or parsed.username or parsed.password:
+            return ''
+        return (parsed.hostname or '').lower().rstrip('.')
+    except ValueError:
+        return ''
+
+
+def domain_matches(host, domain):
+    domain = domain.strip().lower().rstrip('.')
+    return bool(domain) and (host == domain or host.endswith('.' + domain))
+
+
+class OpenSerpSearch:
+    def __init__(self, base_url, api_key, engines=DEFAULT_ENGINES, *, timeout=24,
+                 engine_timeout=10, transport=None):
+        import httpx
+        self.engines = tuple(engines)
+        self.timeout = timeout
+        self.engine_timeout = engine_timeout
+        self.client = httpx.AsyncClient(
+            base_url=base_url.rstrip('/'), follow_redirects=False,
+            headers={'Authorization': 'Bearer ' + api_key, 'Accept': 'application/json'},
+            transport=transport)
 
     async def __call__(self, query, include, exclude):
-        # The public search() has no domain-filter arguments (SGLang 0.5.23 and 0.5.24.dev).
-        payload = self.client._search_payload(query)
-        if include:
-            payload['includeDomains'] = list(include)
-        if exclude:
-            payload['excludeDomains'] = list(exclude)
-        return await self.client._post('/search', payload)
+        deadline = time.monotonic() + self.timeout
+        answered = False
+        for engine in self.engines:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            try:
+                LOGGER.info('OpenSERP web search attempt: engine=%s', engine)
+                async with asyncio.timeout(min(self.engine_timeout, remaining)):
+                    response = await self.client.get('/mega/search', params={
+                        'text': query, 'engines': engine, 'mode': 'balanced',
+                        'limit': 10, 'format': 'json',
+                    }, timeout=min(self.engine_timeout, remaining))
+                response.raise_for_status()
+                payload = response.json()
+                raw_results = payload.get('results')
+                if not isinstance(raw_results, list) or any(not isinstance(r, dict) for r in raw_results):
+                    raise RuntimeError('Invalid OpenSERP search response')
+                answered = True
+                results = []
+                for item in raw_results:
+                    if item.get('type', 'organic') != 'organic':
+                        continue
+                    url = str(item.get('url') or '')
+                    host = result_domain(url)
+                    if not host:
+                        continue
+                    if include and not any(domain_matches(host, domain) for domain in include):
+                        continue
+                    if exclude and any(domain_matches(host, domain) for domain in exclude):
+                        continue
+                    snippet = str(item.get('snippet') or '')
+                    results.append({'title': str(item.get('title') or ''), 'url': url,
+                                    'highlights': [snippet] if snippet else []})
+                if results:
+                    LOGGER.info('OpenSERP web search completed: engine=%s results=%d', engine, len(results))
+                    return {'results': results[:5]}
+            except Exception as error:
+                # Provider responses can contain query text or credentials.
+                LOGGER.warning('OpenSERP engine failed: engine=%s error=%s', engine, type(error).__name__)
+        if answered:
+            return {'results': []}
+        raise RuntimeError('All OpenSERP engines failed')
 
     async def close(self):
-        await self.client.close()
+        await self.client.aclose()
 
 
 def search_request(body):
@@ -126,12 +184,12 @@ class WebSearchMiddleware:
                 response = await self.searcher(query, include, exclude)
                 results = response.get('results')
                 if not isinstance(results, list) or any(not isinstance(r, dict) for r in results):
-                    raise RuntimeError('Invalid Exa search response')
+                    raise RuntimeError('Invalid search provider response')
                 self.cache[key] = (time.monotonic(), results)
                 self.cache.move_to_end(key)
                 while len(self.cache) > self.cache_limit:
                     self.cache.popitem(last=False)
-                LOGGER.info('Exa web search completed: results=%d', len(results))
+                LOGGER.info('Web search completed: results=%d', len(results))
                 return results
             task = asyncio.create_task(fetch())
             self.pending[key] = task
@@ -163,7 +221,7 @@ class WebSearchMiddleware:
         headers = dict((name.lower(), value) for name, value in scope.get('headers', []))
         supplied = headers.get(b'authorization', b'')
         # Native auth is also installed outside this middleware. Keep this
-        # check so a different mounting order can never spend Exa credits first.
+        # check so a different mounting order cannot contact the provider first.
         if not hmac.compare_digest(supplied, ('Bearer ' + self.api_key).encode()):
             return await self.app(scope, receive, send)
         chunks = []
@@ -190,8 +248,8 @@ class WebSearchMiddleware:
             except Exception as error:
                 # Provider response bodies may contain credentials or user
                 # text. Log only the exception class, never the raw exception.
-                LOGGER.warning('Exa web search failed: %s', type(error).__name__)
-                return await self.error(send, 502, 'api_error', 'Exa web search is unavailable; retry later.')
+                LOGGER.warning('Web search failed: %s', type(error).__name__)
+                return await self.error(send, 502, 'api_error', 'Web search is unavailable; retry later.')
             content = message['content']
             block = {'type': 'text', 'text': evidence(query, results)}
             message['content'] = ([{'type': 'text', 'text': content}] if isinstance(content, str)
@@ -217,7 +275,9 @@ class WebSearchMiddleware:
         return await self.app(scope, replay, send)
 
 
-def install(api_key, exa_api_key):
+def install(api_key, openserp_api_key, base_url, engines=DEFAULT_ENGINES):
     from sglang.srt.entrypoints.http_server import app
-    app.add_middleware(WebSearchMiddleware, searcher=ExaSearch(exa_api_key), api_key=api_key)
-    LOGGER.info('Anthropic Exa search adapter enabled (auto, 5 results, 600-second cache)')
+    searcher = OpenSerpSearch(base_url, openserp_api_key, engines)
+    app.add_middleware(WebSearchMiddleware, searcher=searcher, api_key=api_key)
+    LOGGER.info('Anthropic OpenSERP search adapter enabled (engines=%s, 5 results, 600-second cache)',
+                ','.join(engines))

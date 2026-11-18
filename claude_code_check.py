@@ -10,7 +10,7 @@ neither used nor changed.
 
   basic        a one-line answer, no tools
   max-tokens   CLAUDE_CODE_MAX_OUTPUT_TOKENS=256 on a long answer: requests carry 256, responses stop there
-  search       Claude Code's WebSearch tool: its server-tool subrequest comes back with Exa source URLs
+  search       Claude Code's WebSearch tool: its server-tool subrequest comes back with OpenSERP source URLs
   thinking     MAX_THINKING_TOKENS=2048: records what Claude Code sends for thinking with this model
   pdf          the Read tool on a two-page PDF (a text code; an image-only code and a bar chart): Claude Code
                sends it as a document block and the answer has both codes (fixture: run with the venv's Python)

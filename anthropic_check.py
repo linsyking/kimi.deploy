@@ -3,8 +3,8 @@
 
   vision, tool, stream   image input, a tool call and its result, each as JSON and streamed
   effort                 every Anthropic output_config.effort and OpenAI reasoning_effort level answers
-  search                 Exa web search through web_search.py: the answer cites the evidence URLs
-  no-search              a request without the server search tool makes no Exa call
+  search                 OpenSERP web search through web_search.py: the answer cites the evidence URLs
+  no-search              a request without the server search tool makes no provider call
   budget                 thinking.budget_tokens: reasoning stops at the budget and an answer follows;
                          raw token ids through OpenAI chat custom_params, mixed budgets in one batch,
                          and a budgeted tool call round trip
@@ -23,12 +23,14 @@ import concurrent.futures
 import datetime
 import json
 from pathlib import Path
+import re
 import secrets
 import statistics
 import sys
 import time
 import urllib.error
 import urllib.request
+from urllib.parse import urlsplit
 
 from smoke_test import png
 
@@ -168,34 +170,47 @@ def check_effort(client):
     return all(value in ('end_turn', 'stop') for value in detail.values()), detail
 
 
-def exa_log_lines():
+def citations_allowed(answer, domains):
+    hosts = []
+    for url in re.findall(r'\]\((https?://[^)\s]+)\)', answer):
+        try:
+            host = (urlsplit(url).hostname or '').lower().rstrip('.')
+        except ValueError:
+            continue
+        if host:
+            hosts.append(host)
+    return bool(hosts) and all(any(host == domain or host.endswith('.' + domain)
+                                   for domain in domains) for host in hosts)
+
+
+def search_log_lines():
     log = ROOT / 'sglang.log'
-    return log.read_text(errors='replace').count('Exa web search completed') if log.exists() else 0
+    return log.read_text(errors='replace').count('OpenSERP web search attempt') if log.exists() else 0
 
 
 def check_search(client):
     results = {}
+    domains = ('github.com', 'docs.sglang.ai', 'docs.sglang.io', 'lmsys.org')
     for mode, version in (('json', 'web_search_20250305'), ('stream', 'web_search_20260209')):
         call = client.stream if mode == 'stream' else client.messages
         response = call(max_tokens=4096, system='Answer in one sentence and cite one source URL from the search evidence.',
-                        messages=[{'role': 'user', 'content': 'Perform a web search for the query: SGLang Exa web search support'}],
-                        tools=[{'type': version, 'name': 'web_search', 'allowed_domains': ['github.com', 'docs.sglang.ai']}],
+                        messages=[{'role': 'user', 'content': 'Perform a web search for the query: SGLang Anthropic Messages API support'}],
+                        tools=[{'type': version, 'name': 'web_search', 'allowed_domains': list(domains)}],
                         tool_choice={'type': 'tool', 'name': 'web_search'}, **LOW)
         answer = text(response)
-        results[mode] = ('https://' in answer and any(d in answer for d in ('github.com', 'docs.sglang.ai')),
-                         brief(response, tool_type=version))
+        results[mode] = (citations_allowed(answer, domains), brief(response, tool_type=version))
     return all(ok for ok, _ in results.values()), {mode: detail for mode, (_, detail) in results.items()}
 
 
 def check_no_search(client):
     # A client-defined tool that happens to be called web_search is not Anthropic's server tool.
-    before = exa_log_lines()
+    before = search_log_lines()
     response = client.messages(max_tokens=2048, messages=[{'role': 'user', 'content': 'Reply with the word ready.'}],
                                tools=[{'name': 'web_search', 'description': 'A client tool.',
                                        'input_schema': {'type': 'object', 'properties': {}}}], **LOW)
-    after = exa_log_lines()
+    after = search_log_lines()
     return after == before and response.get('stop_reason') in ('end_turn', 'tool_use'), \
-        brief(response, exa_log_lines_before=before, exa_log_lines_after=after)
+        brief(response, search_log_lines_before=before, search_log_lines_after=after)
 
 
 def check_budget(client):

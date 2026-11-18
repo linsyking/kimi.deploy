@@ -8,7 +8,7 @@ from web_search import WebSearchMiddleware
 
 def request(tool_type='web_search_20250305'):
     return {'model': 'test', 'messages': [{'role': 'user', 'content':
-            'Perform a web search for the query: SGLang Exa integration'}],
+            'Perform a web search for the query: SGLang OpenSERP integration'}],
             'tools': [{'type': tool_type, 'name': 'web_search'}],
             'tool_choice': {'type': 'tool', 'name': 'web_search'}}
 
@@ -82,7 +82,7 @@ class SearchTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_search_rewrites_and_preserves_streaming(self):
         sent = await self.invoke(request())
-        self.assertEqual(self.searcher.calls, [('SGLang Exa integration', (), ())])
+        self.assertEqual(self.searcher.calls, [('SGLang OpenSERP integration', (), ())])
         scope, raw = self.forwarded[-1]
         result = json.loads(raw)
         self.assertNotIn('tools', result)
@@ -129,7 +129,7 @@ class SearchTests(unittest.IsolatedAsyncioTestCase):
         body['tools'][0]['allowed_domains'] = ['docs.sglang.ai']
         await self.invoke(body)
         await self.invoke(body)
-        self.assertEqual(self.searcher.calls, [('SGLang Exa integration', ('docs.sglang.ai',), ())])
+        self.assertEqual(self.searcher.calls, [('SGLang OpenSERP integration', ('docs.sglang.ai',), ())])
         body['tools'][0].pop('allowed_domains')
         body['tools'][0]['blocked_domains'] = ['example.com']
         await self.invoke(body)
@@ -182,34 +182,144 @@ class SearchTests(unittest.IsolatedAsyncioTestCase):
         await self.invoke(body)
         self.assertFalse(self.searcher.calls)
 
-    async def test_lifespan_closes_exa_connection(self):
+    async def test_lifespan_closes_provider_connection(self):
         async def ignore(*args):
             pass
         await self.middleware({'type': 'lifespan'}, ignore, ignore)
         self.assertTrue(self.searcher.closed)
 
 
-class InstalledExaClientTests(unittest.IsolatedAsyncioTestCase):
-    """ExaSearch uses private ExaClient members; check them against the installed SGLang.
+class OpenSerpSearchTests(unittest.IsolatedAsyncioTestCase):
+    async def test_fallback_payload_and_auth(self):
+        import httpx
+        from web_search import OpenSerpSearch
+        calls = []
 
-    Runs under the venv's Python; skipped where SGLang is not importable. No network."""
-    async def test_payload_and_filters(self):
+        def handler(request):
+            engine = request.url.params['engines']
+            calls.append(request)
+            if engine == 'duckduckgo':
+                return httpx.Response(503, json={'error': 'provider text must not escape'})
+            return httpx.Response(200, json={'results': [{
+                'type': 'organic', 'title': 'SGLang', 'url': 'https://github.com/sgl-project/sglang',
+                'snippet': 'SGLang inference engine.',
+            }]})
+
+        search = OpenSerpSearch('https://search.test', 'test-key',
+                                transport=httpx.MockTransport(handler))
         try:
-            from web_search import ExaSearch
-            search = ExaSearch('test-key')
-        except ImportError as error:
-            self.skipTest(f'SGLang not importable: {error}')
-        sent = []
-        async def post(path, payload):
-            sent.append((path, payload))
-            return {'results': []}
-        search.client._post = post
-        await search('SGLang Exa integration', ('docs.sglang.ai',), ())
-        self.assertEqual(sent, [('/search', {'query': 'SGLang Exa integration', 'numResults': 5, 'type': 'auto',
-                                             'contents': {'highlights': True},
-                                             'includeDomains': ['docs.sglang.ai']})])
-        self.assertEqual(search.client.timeout, 15)
-        await search.close()
+            response = await search('SGLang OpenSERP integration', (), ())
+        finally:
+            await search.close()
+        self.assertEqual([call.url.params['engines'] for call in calls], ['duckduckgo', 'bing'])
+        request = calls[0]
+        self.assertEqual(request.headers['authorization'], 'Bearer test-key')
+        self.assertEqual(request.url.path, '/mega/search')
+        self.assertEqual(request.url.params['mode'], 'balanced')
+        self.assertEqual(request.url.params['limit'], '10')
+        self.assertEqual(request.url.params['text'], 'SGLang OpenSERP integration')
+        self.assertEqual(response['results'], [{
+            'title': 'SGLang', 'url': 'https://github.com/sgl-project/sglang',
+            'highlights': ['SGLang inference engine.'],
+        }])
+
+    async def test_domain_filters_and_result_cap(self):
+        import httpx
+        from web_search import OpenSerpSearch
+
+        def handler(request):
+            urls = ['https://docs.github.com/one', 'https://evil.github.com/skip',
+                    'https://example.com/skip', 'https://github.com/two', 'https://github.com/three',
+                    'https://github.com/four', 'https://github.com/five', 'https://github.com/six']
+            return httpx.Response(200, json={'results': [
+                {'title': url, 'url': url, 'snippet': 'evidence'} for url in urls
+            ]})
+
+        search = OpenSerpSearch('https://search.test', 'test-key',
+                                transport=httpx.MockTransport(handler))
+        try:
+            response = await search('query', ('GitHub.com',), ('evil.github.com',))
+        finally:
+            await search.close()
+        self.assertEqual([item['url'] for item in response['results']], [
+            'https://docs.github.com/one', 'https://github.com/two', 'https://github.com/three',
+            'https://github.com/four', 'https://github.com/five',
+        ])
+
+    async def test_empty_results_fall_back(self):
+        import httpx
+        from web_search import OpenSerpSearch
+        calls = []
+
+        def handler(request):
+            engine = request.url.params['engines']
+            calls.append(engine)
+            results = [] if engine != 'yandex' else [{
+                'title': 'Yandex result', 'url': 'https://example.org/', 'snippet': 'found',
+            }]
+            return httpx.Response(200, json={'results': results})
+
+        search = OpenSerpSearch('https://search.test', 'test-key',
+                                transport=httpx.MockTransport(handler))
+        try:
+            response = await search('query', (), ())
+        finally:
+            await search.close()
+        self.assertEqual(calls, ['duckduckgo', 'bing', 'yandex'])
+        self.assertEqual(response['results'][0]['title'], 'Yandex result')
+
+    async def test_valid_empty_results_do_not_fail(self):
+        import httpx
+        from web_search import OpenSerpSearch
+
+        def handler(request):
+            return httpx.Response(200, json={'results': []})
+
+        search = OpenSerpSearch('https://search.test', 'test-key',
+                                transport=httpx.MockTransport(handler))
+        try:
+            response = await search('query', (), ())
+        finally:
+            await search.close()
+        self.assertEqual(response, {'results': []})
+
+    async def test_slow_response_is_bounded(self):
+        import httpx
+        from web_search import OpenSerpSearch
+        calls = []
+
+        async def handler(request):
+            calls.append(request.url.params['engines'])
+            await asyncio.sleep(0.2)
+            return httpx.Response(200, json={'results': []})
+
+        search = OpenSerpSearch('https://search.test', 'test-key', engines=('duckduckgo', 'bing', 'yandex', 'ecosia'),
+                                timeout=0.05, engine_timeout=0.02, transport=httpx.MockTransport(handler))
+        try:
+            with self.assertRaisesRegex(RuntimeError, 'All OpenSERP engines failed'):
+                await asyncio.wait_for(search('query', (), ()), timeout=0.5)
+        finally:
+            await search.close()
+        self.assertTrue(calls)
+        self.assertLessEqual(len(calls), 3)
+
+    async def test_all_engines_fail(self):
+        import httpx
+        from web_search import OpenSerpSearch
+        calls = []
+
+        def handler(request):
+            calls.append(request.url.params['engines'])
+            return httpx.Response(503, json={'error': 'unavailable'})
+
+        search = OpenSerpSearch('https://search.test', 'test-key',
+                                transport=httpx.MockTransport(handler))
+        try:
+            with self.assertRaisesRegex(RuntimeError, 'All OpenSERP engines failed'):
+                await search('query', (), ())
+        finally:
+            await search.close()
+        self.assertEqual(calls, ['duckduckgo', 'bing', 'yandex'])
 
 
 if __name__ == '__main__':

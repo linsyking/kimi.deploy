@@ -35,6 +35,13 @@
   "mamba_ssm_dtype": "float32",
   "radix_cache": true,
   "enable_web_search": true,
+  "search_provider": "openserp",
+  "openserp_base_url": "https://dsh.linsyking.com",
+  "openserp_engines": [
+    "duckduckgo",
+    "bing",
+    "yandex"
+  ],
   "enable_documents": true,
   "enforce_thinking_budget": true,
   "medium_effort_as": "high",

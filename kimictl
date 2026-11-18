@@ -44,8 +44,12 @@ API_KEY = PRIVATE / 'api-key'
 # Without an admin key SGLang lets the API key call its admin endpoints (weight updates, memory
 # release, pause); with one set they take only the admin key, which is never shared.
 ADMIN_KEY = PRIVATE / 'admin-api-key'
-# Exa credential for the Anthropic web-search adapter; read on rank 0 only, never synced or logged.
+# Search credentials are read on rank 0 only, never synced or logged. The Exa
+# path remains only so an old key is still redacted if it appears in an old log.
+OPENSERP_KEY = PRIVATE / 'openserp-api-key'
 EXA_KEY = PRIVATE / 'exa-api-key'
+SEARCH_ENGINES = {'duckduckgo', 'bing', 'yandex', 'google', 'baidu', 'ecosia'}
+DEFAULT_SEARCH_ENGINES = ['duckduckgo', 'bing', 'yandex']
 AUTH_CONFIG = PRIVATE / 'sglang-auth.yaml'
 # frp publishes the API on the frp server's loopback only; c02's DeepSeek tunnel owns remote 8312.
 FRPC = LOCAL_BIN / 'frpc'
@@ -64,7 +68,8 @@ GPU_IDLE_MIB = 1024
 # The driver frees a process's GPU memory only after the process is reaped; how long stop waits.
 GPU_RELEASE_SECONDS = 180
 RUNTIME_FILES = ['kimictl', 'serving.json', 'verify_venv.py', 'evict_page_cache.py', 'web_search.py',
-                 'documents.py', 'requirements-documents.txt', 'thinking_budget.py', 'checkpoint_overlay.py',
+                 'documents.py', 'requirements-documents.txt', 'thinking_budget.py', 'effort_prompt.py',
+                 'checkpoint_overlay.py',
                  'modelctl', 'README.md', 'DEPLOYMENT_STATUS.md', '.gitignore']
 OVERLAY_ENV = ['KIMI_CHECKPOINT_OVERLAY', 'KIMI_CHECKPOINT_BASE', 'KIMI_CHECKPOINT_AUDIT_DIR']
 # The only nodes this deployment may use, in rank order: name -> (bond0 IP, hostname).
@@ -81,7 +86,7 @@ OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 def redact_log_records():
     # SGLang logs server_args, api_key included. Also runs when multiprocessing imports this
     # entrypoint in scheduler processes.
-    keys = [path.read_text().strip() for path in (API_KEY, ADMIN_KEY, EXA_KEY) if path.exists()]
+    keys = [path.read_text().strip() for path in (API_KEY, ADMIN_KEY, OPENSERP_KEY, EXA_KEY) if path.exists()]
     keys = [key for key in keys if key]
     if not keys:
         return
@@ -138,6 +143,11 @@ if os.environ.get('KIMI_MEDIUM_EFFORT'):
         from sglang.srt.entrypoints.openai import serving_kimi_k3
         tiers = serving_kimi_k3._KIMI_K31_LEVEL_BY_TIER
     tiers['medium'] = os.environ['KIMI_MEDIUM_EFFORT']
+
+# Requests may replace the encoder's thinking-effort message (README, "Thinking-effort prompt").
+if os.environ.get('KIMI_ENGINE') == '1':
+    from effort_prompt import install
+    install()
 
 # The branch's clean-up aa6bae9ee7 dropped need_lse from dcp_trtllm_sparse_attention, which now
 # always returns the LSE, but the DFLASH draft's sliding-window caller still passes it and FlashInfer
@@ -209,6 +219,22 @@ def config():
         raise ValueError('speculative must be null or a DFLASH block')
     if not isinstance(cfg.get('enable_documents', False), bool):
         raise ValueError('enable_documents must be true or false')
+    if not isinstance(cfg.get('enable_web_search', False), bool):
+        raise ValueError('enable_web_search must be true or false')
+    if cfg.get('search_provider', 'openserp') != 'openserp':
+        raise ValueError('search_provider must be openserp')
+    from urllib.parse import urlsplit
+    base_url = cfg.get('openserp_base_url', 'https://dsh.linsyking.com')
+    parsed = urlsplit(base_url) if isinstance(base_url, str) else None
+    if (parsed is None or parsed.scheme != 'https' or not parsed.hostname
+            or parsed.username or parsed.password or parsed.path not in ('', '/')
+            or parsed.query or parsed.fragment):
+        raise ValueError('openserp_base_url must be an HTTPS service root without credentials')
+    engines = cfg.get('openserp_engines', DEFAULT_SEARCH_ENGINES)
+    if (not isinstance(engines, list) or not engines
+            or any(not isinstance(engine, str) or engine not in SEARCH_ENGINES for engine in engines)
+            or len(set(engines)) != len(engines)):
+        raise ValueError(f'openserp_engines must be unique engines from {sorted(SEARCH_ENGINES)}')
     if not isinstance(cfg.get('checkpoint_overlay', ''), str):
         raise ValueError('checkpoint_overlay must be a path string or absent')
     if not re.fullmatch(r'[A-Za-z0-9._-]+', cfg.get('venv', 'sglang')):
@@ -217,6 +243,8 @@ def config():
     if not (isinstance(sampling, dict) and set(sampling) <= SAMPLING_FIELDS
             and all(type(value) in (int, float) for value in sampling.values())):
         raise ValueError(f'default_sampling must map some of {sorted(SAMPLING_FIELDS)} to numbers')
+    if 'thinking_effort_prompt' in cfg:
+        raise ValueError('thinking_effort_prompt is per request now; remove it from serving.json')
     return cfg
 
 
@@ -405,8 +433,8 @@ def node_preflight(cfg, rank):
     if rank == 0:
         required += [API_KEY, ADMIN_KEY, AUTH_CONFIG]
     problems += [f'missing {path}' for path in required if not path.exists()]
-    if rank == 0 and cfg.get('enable_web_search') and not (EXA_KEY.exists() and EXA_KEY.read_text().strip()):
-        problems.append(f'web search is enabled but {EXA_KEY} is missing or empty')
+    if rank == 0 and cfg.get('enable_web_search') and not (OPENSERP_KEY.exists() and OPENSERP_KEY.read_text().strip()):
+        problems.append(f'web search is enabled but {OPENSERP_KEY} is missing or empty')
     if rank == 0 and cfg.get('enable_documents'):
         probe = subprocess.run([str(venv(cfg) / 'bin/python'), '-I', '-c', 'import pypdfium2, PIL, httpx'],
                                capture_output=True, text=True, timeout=60)
@@ -452,7 +480,8 @@ def launch_environment(cfg):
     cache = RUNS / 'kernel-cache' / venv(cfg).name
     env = {key: value for key, value in os.environ.items()
            if key not in ('HF_TOKEN', 'NCCL_DEBUG_SUBSYS', 'http_proxy', 'https_proxy', 'all_proxy',
-                          'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'PYTHONPATH', 'VIRTUAL_ENV', *OVERLAY_ENV)}
+                          'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'PYTHONPATH', 'VIRTUAL_ENV',
+                          *OVERLAY_ENV)}
     env.update(
         # Non-interactive SSH sets HOME to the NFS home; keep every default cache on scratch.
         HOME=SCRATCH_HOME, CUDA_HOME=str(cuda), CUDA_PATH=str(cuda),
@@ -564,7 +593,11 @@ def engine():
     # user text, before documents expand, so page text never becomes its query.
     if config().get('enable_web_search') and server_args.node_rank == 0:
         from web_search import install
-        install(api_key=API_KEY.read_text().strip(), exa_api_key=EXA_KEY.read_text().strip())
+        cfg = config()
+        install(api_key=API_KEY.read_text().strip(),
+                openserp_api_key=OPENSERP_KEY.read_text().strip(),
+                base_url=cfg.get('openserp_base_url', 'https://dsh.linsyking.com'),
+                engines=cfg.get('openserp_engines', DEFAULT_SEARCH_ENGINES))
     try:
         run_server(server_args)
     finally:
@@ -904,10 +937,13 @@ def status(cfg):
         sampling = ', '.join(f'{key} {value}' for key, value in cfg.get('default_sampling', {}).items())
         sampling = sampling + ' (requests override)' if sampling else "SGLang's (temperature 1, top_p 1)"
         print(f'Engine: {engine} ({venv(cfg).relative_to(ROOT)}); sampling defaults: {sampling}')
-        print(f'Anthropic extras: web search {"Exa" if cfg.get("enable_web_search") else "off"}; '
+        search_status = ('OpenSERP (' + ','.join(cfg.get('openserp_engines', DEFAULT_SEARCH_ENGINES)) + ')'
+                         if cfg.get('enable_web_search') else 'off')
+        print(f'Anthropic extras: web search {search_status}; '
               f'documents {"PDF text + page images" if cfg.get("enable_documents") else "off"}; '
               f'thinking budget {"enforced" if cfg.get("enforce_thinking_budget") else "off"}; '
-              f'effort medium -> {cfg.get("medium_effort_as") or "unmapped (HTTP 500)"}')
+              f'effort medium -> {cfg.get("medium_effort_as") or "unmapped (HTTP 500)"}; '
+              f'effort prompt per request')
         print(f'Weights: {weights_summary(cfg, states)[0]}')
     print(f'Tunnel: {"running" if state_is_alive(tunnel_state()) else "stopped"} '
           f'(frp server port {TUNNEL_PORT}; kimictl tunnel status)')

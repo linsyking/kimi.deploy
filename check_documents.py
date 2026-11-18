@@ -144,7 +144,7 @@ def main():
         status, response = error_response(cfg, ctl, invalid)
         record(dict(name=name, passed=status == 400 and response.get('error', {}).get('type') == 'invalid_request_error',
                     status=status, response=response))
-    # Search must take its query from the user's text even with page text in the same turn. Exa
+    # Search must take its query from the user's text even with page text in the same turn. Provider
     # queries are not logged, so judge by the sources: the user's query finds SGLang's docs or
     # repository; a query made of page text ("Page 2/2 ... read the page image") would not.
     query = 'SGLang Anthropic document support'
